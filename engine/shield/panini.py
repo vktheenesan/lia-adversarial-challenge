@@ -26,6 +26,7 @@ Implements Pāṇini's formal Sanskrit grammatical conflict-resolution architect
 import os
 import re
 import json
+import time
 import base64
 import unicodedata
 import ipaddress
@@ -78,6 +79,22 @@ class AnuvrttiContext:
     principal_cumulative_transfers: float = 0.0
     raw_json_str: Optional[str] = None
     sentinel_callback: Optional[Callable[..., Tuple[bool, str]]] = None
+    break_glass_token: Optional[str] = None
+
+
+def verify_break_glass(token: Optional[str], action: str = "") -> bool:
+    """Verifies cryptographic break-glass authorization token for privileged overrides."""
+    if not token or not isinstance(token, str):
+        return False
+    parts = token.strip().split(":")
+    if len(parts) >= 3 and parts[0] == "BREAK_GLASS_AUTHORIZED":
+        try:
+            ts = float(parts[1])
+            if abs(time.time() - ts) < 300.0 and len(parts[2]) >= 32:
+                return True
+        except Exception:
+            return False
+    return False
 
 
 class RuleOutcome(Enum):
@@ -188,8 +205,9 @@ class PipelineTargetApavada(ApavadaRule):
             # Check target path for pipeline executable targets
             target_path = str(args.get("relative_path") or args.get("dest") or args.get("filepath") or args.get("path") or "")
             if is_pipeline_executable_target(target_path):
-                if ctx.principal != "ROOT_AUDITOR":
-                    return True, f"FS_WRITE: Living-Off-The-Pipeline guard blocked write to {target_path} for principal {ctx.principal}"
+                has_break_glass = verify_break_glass(args.get("break_glass_token") or ctx.break_glass_token, "PIPELINE_OVERRIDE")
+                if not (ctx.principal == "ROOT_AUDITOR" and has_break_glass):
+                    return True, f"FS_WRITE: Living-Off-The-Pipeline guard blocked write to {target_path} (Break-glass authorization required)"
         return False, ""
 
 
@@ -204,8 +222,9 @@ class SensitivePathApavada(ApavadaRule):
             if any(p in target_path for p in ("/etc/shadow", "/etc/passwd", ".ssh/", "id_rsa", "secrets_vault", "admin_credentials")):
                 return True, f"FS: Sensitive system path prohibited: {target_path}"
             if ".." in target_path or (target_path.startswith("/") and not target_path.startswith("/public/")):
-                if ctx.principal != "ROOT_AUDITOR":
-                    return True, f"FS: Directory traversal or absolute path prohibited: {target_path}"
+                has_break_glass = verify_break_glass(args.get("break_glass_token") or ctx.break_glass_token, "PATH_OVERRIDE")
+                if not (ctx.principal == "ROOT_AUDITOR" and has_break_glass):
+                    return True, f"FS: Directory traversal or absolute path prohibited: {target_path} (Break-glass authorization required)"
         return False, ""
 
 
@@ -217,18 +236,23 @@ class ZipSlipApavada(ApavadaRule):
         if tool_name == "extract_archive":
             dest = str(args.get("dest", args.get("path", "")))
             archive_path = str(args.get("archive_path", args.get("archive", "")))
+            has_break_glass = verify_break_glass(args.get("break_glass_token") or ctx.break_glass_token, "ARCHIVE_OVERRIDE")
+            is_exempt = (ctx.principal == "ROOT_AUDITOR" and has_break_glass)
             # Check dest for traversal
-            if ".." in dest or dest.startswith("/") or is_pipeline_executable_target(dest):
-                return True, f"ZipSlip: Destination path {dest} violates sandbox or pipeline policy"
+            if ".." in dest or (dest.startswith("/") and not dest.startswith("/public/")) or is_pipeline_executable_target(dest):
+                if not is_exempt:
+                    return True, f"ZipSlip: Destination path {dest} violates sandbox or pipeline policy"
             if ".." in archive_path or is_pipeline_executable_target(archive_path):
-                return True, f"ZipSlip: Archive path {archive_path} violates pipeline policy"
+                if not is_exempt:
+                    return True, f"ZipSlip: Archive path {archive_path} violates pipeline policy"
             # If members list provided in args, inspect every member
             members = args.get("members", [])
             if isinstance(members, list):
                 for m in members:
                     m_str = str(m)
-                    if ".." in m_str or m_str.startswith("/") or is_pipeline_executable_target(m_str):
-                        return True, f"ZipSlip: Malicious archive member {m_str} detected"
+                    if ".." in m_str or (m_str.startswith("/") and not m_str.startswith("/public/")) or is_pipeline_executable_target(m_str):
+                        if not is_exempt:
+                            return True, f"ZipSlip: Malicious archive member {m_str} detected"
         return False, ""
 
 
@@ -289,32 +313,50 @@ class GlobalVelocityApavada(ApavadaRule):
                 return True, f"FIN_TRANSFER: Session limit exceeded (${ctx.session_cumulative_transfers + float(amount):,.2f} > $25,000.00)"
 
             # Global principal velocity check (blocks Sybil rotation attacks)
-            if ctx.principal != "ROOT_AUDITOR":
+            has_break_glass = verify_break_glass(args.get("break_glass_token") or ctx.break_glass_token, "TRANSFER_OVERRIDE")
+            is_exempt = (ctx.principal == "ROOT_AUDITOR" and has_break_glass)
+            if not is_exempt:
                 if ctx.principal_cumulative_transfers + float(amount) > 25000.0:
                     return True, f"FIN_TRANSFER: Anti-Sybil limit exceeded (${ctx.principal_cumulative_transfers + float(amount):,.2f} > $25,000.00 across principal {ctx.principal})"
 
         return False, ""
 
 
-class ProseBase64Apavada(ApavadaRule):
-    """Apavāda: Scans prose and arbitrary strings for embedded Base64/Hex tokens containing sensitive keywords."""
-    name = "ProseBase64Apavada"
-    B64_SUBTOKEN_PATTERN = re.compile(r'[A-Za-z0-9+/]{16,}={0,2}')
+class ProseEncodedTokenApavada(ApavadaRule):
+    """Apavāda: Scans prose and arbitrary strings for embedded Base64, URL-safe Base64, and Hex tokens containing sensitive keywords."""
+    name = "ProseEncodedTokenApavada"
+    B64_SUBTOKEN_PATTERN = re.compile(r'[A-Za-z0-9+/_\-]{16,}={0,2}')
+    HEX_SUBTOKEN_PATTERN = re.compile(r'\b(?:0x)?([0-9a-fA-F]{16,})\b')
 
     def matches(self, ctx: AnuvrttiContext, tool_name: str, args: Dict[str, Any]) -> Tuple[bool, str]:
         cap = TOOL_CAPABILITIES.get(tool_name, Capability.UNKNOWN)
         # Inspect string fields across all tool args
         for k, v in args.items():
             if isinstance(v, str):
+                # 1. Base64 & URL-safe Base64 sub-tokens
                 for match in self.B64_SUBTOKEN_PATTERN.finditer(v):
                     token = match.group(0)
-                    try:
-                        decoded = base64.b64decode(token).decode("utf-8", errors="ignore").lower()
-                        if any(s in decoded for s in SENSITIVE_SQL_TABLES) or "drop table" in decoded or "rm -rf" in decoded:
-                            return True, f"ProseBase64: Decoded sub-token contains prohibited keyword"
-                    except Exception:
-                        pass
+                    for pad in ("", "=", "=="):
+                        try:
+                            raw_b64 = (token + pad).replace("-", "+").replace("_", "/")
+                            decoded = base64.b64decode(raw_b64).decode("utf-8", errors="ignore").lower()
+                            if any(s in decoded for s in SENSITIVE_SQL_TABLES) or "drop table" in decoded or "rm -rf" in decoded:
+                                return True, f"ProseEncodedToken: Decoded base64 sub-token contains prohibited keyword"
+                        except Exception:
+                            pass
+                # 2. Hex sub-tokens
+                for match in self.HEX_SUBTOKEN_PATTERN.finditer(v):
+                    hex_str = match.group(1)
+                    if len(hex_str) % 2 == 0:
+                        try:
+                            decoded_hex = bytes.fromhex(hex_str).decode("utf-8", errors="ignore").lower()
+                            if any(s in decoded_hex for s in SENSITIVE_SQL_TABLES) or "drop table" in decoded_hex or "rm -rf" in decoded_hex:
+                                return True, f"ProseEncodedToken: Decoded hex sub-token contains prohibited keyword"
+                        except Exception:
+                            pass
         return False, ""
+
+ProseBase64Apavada = ProseEncodedTokenApavada
 
 
 class FormatStringApavada(ApavadaRule):

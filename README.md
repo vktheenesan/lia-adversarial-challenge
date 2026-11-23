@@ -4,8 +4,9 @@
 [![NASA JPL Power of 10](https://img.shields.io/badge/NASA%20JPL%20Power%20of%2010-10%2F10%20VERIFIED-brightgreen)](#-nasa-jpl-power-of-10-formal-audit)
 [![NIST SAMATE CWE](https://img.shields.io/badge/NIST%20SAMATE%20Juliet-100%25%20ELIMINATED-blue)](#-nist-samate--juliet-cwe-software-assurance)
 [![Adversarial Resilience](https://img.shields.io/badge/Adversarial%20Ladder-297%2F297%20CONTAINED-success)](#-10-level-maximum-difficulty-adversarial-ladder)
-[![Latency](https://img.shields.io/badge/Avg%20Latency-107%20%C2%B5s-orange)](#-high-throughput-endurance-benchmark)
-[![Memory Leaks](https://img.shields.io/badge/Memory%20Drift-Bounded%20LRU-purple)](#-high-throughput-endurance-benchmark)
+[![Latency (Cached)](https://img.shields.io/badge/Latency%20(Cached)-107%20%C2%B5s-brightgreen)](#-formal-assurance--benchmark-summary)
+[![Latency (Uncached)](https://img.shields.io/badge/Latency%20(Cold%20P50%2FP99)-5.09ms%20%2F%2052.12ms-orange)](#-formal-assurance--benchmark-summary)
+[![Memory Leaks](https://img.shields.io/badge/Memory%20Drift-Bounded%20LRU-purple)](#-formal-assurance--benchmark-summary)
 [![License](https://img.shields.io/badge/License-Proprietary%20Evaluation-lightgrey.svg)](LICENSE)
 
 > **"If an AI agent or operating system can be jailbroken, it is because its security boundary is probabilistic. LIA replaces probabilistic guardrails with deterministic mathematical invariants."**
@@ -37,9 +38,10 @@ Modern cybersecurity and AI agent deployments suffer from a structural vulnerabi
 | **NASA JPL Power of 10** | Gerard J. Holzmann (JPL / Caltech 2006) | Safety-Critical Code (10 Rules) | **10 / 10 Rules Passed (100.0%)** | <kbd>VERIFIED</kbd> |
 | **NIST SAMATE Juliet CWE** | NIST SARD / MITRE CWE Matrix | Memory corruption, Injection, Traversal | **39 / 39 Vectors Contained (100.0%)** | <kbd>ELIMINATED</kbd> |
 | **10-Level Adversarial Ladder** | Multi-Agent Red Team & Polyglots | 10 escalating attack vectors | **297 / 297 Vectors Neutralized (100.0%)** | <kbd>CONTAINED</kbd> |
-| **High-Throughput Endurance** | 10,000 Cycle Continuous Hammering | Memory drift & Latency | **Bounded LRU (37.9 KB) \| 107.4 µs / eval** | <kbd>DETERMINISTIC</kbd> |
+| **Throughput & Cache Latency** | 10,000 Cycle Continuous Hammering | Deduplication & Drift stability | **Bounded LRU (37.9 KB) \| 107.4 µs / eval (0.11 ms)** | <kbd>DETERMINISTIC</kbd> |
+| **Cold / Uncached Latency** | 2,500 Unique Sessions (Cold AST + DIFC) | Full schema & AST parse under load | **P50: 5.09 ms \| P95: 18.96 ms \| P99: 52.12 ms** | <kbd>MEASURED</kbd> |
 
-*Measured latency reflects live Python reference monitor execution with Pydantic v2 closed-world validation, AST SQL normalization, and DIFC taint tracking (~107 µs average, P99 ~16–48 ms under high-volume cold/un-cached AST parsing).*
+*Measured latencies reflect live Python reference monitor execution with Pydantic v2 closed-world validation, AST SQL normalization, and DIFC taint tracking: cached repeat payloads evaluate in ~107.4 µs (0.11 ms), while cold unique sessions with full AST traversal measure 5.09 ms P50 and 52.12 ms P99.*
 
 ---
 
@@ -61,7 +63,7 @@ python3 challenge_runner.py --all
 # Run the benign baseline suite (0% false positives)
 python3 challenge_runner.py --benign
 
-# Run the automated regression suite (54/54 tests)
+# Run the automated regression suite (62/62 tests)
 python3 -m unittest discover -s tests -v
 ```
 
@@ -140,6 +142,27 @@ python3 challenge_runner.py --custom /path/to/your_exploit.bin
 * **Level 8:** Coordinated Multi-Agent Swarm Attacks (25/25 Blocked).
 * **Level 9:** Direct Attack on the LIA Engine Itself: Anti-reverse & memory scanning (20/20 Blocked).
 * **Level 10:** The Unknown Unknown: Adaptive Red-Team Autonomous Goal Seekers (7/7 Blocked).
+
+---
+
+## 🛡️ Architecture Scope & Known Out-of-Layer Boundaries
+
+LIA adheres to a strict principle of **adversarial honesty**: software security is a multi-layered stack. An application-layer Reference Monitor provides mathematically provable invariants over tool calls, arguments, and schemas, but cannot unilaterally replace operating system, hardware, and kernel boundaries.
+
+The table below delineates what LIA's Reference Monitor enforces **In-Layer**, and where **Out-of-Layer Defense-in-Depth** controls are mandatory in production deployments:
+
+| # | Threat Archetype | LIA In-Layer Enforcement (Reference Monitor) | Out-of-Layer Defense-in-Depth (Production Stack) |
+| :-: | :--- | :--- | :--- |
+| **1** | **In-Process Memory Introspection & Patching** | `MappingProxyType` frozen mappings, `__slots__`, non-evicting stores, and tamper-resistant immutability. | **Process Isolation / MicroVM:** Run untrusted agent runners in separate OS processes or Firecracker / gVisor MicroVMs; never share Python address space. |
+| **2** | **Filesystem TOCTOU & Symlink Races** | Strict path canonicalization (`canonicalize_path`), traversal blocking, and `PIPELINE_EXEC_PATTERNS`. | **Kernel LSM / eBPF:** Use Linux `openat2(..., RESOLVE_BENEATH)` or eBPF LSM `file_open` hooks to guarantee non-traversal at atomic inode resolution. |
+| **3** | **Out-of-Band & Ambient Exfiltration** | Closed-world schema validation, domain allowlisting, IP literal blocking, and hex/base64 keyword decoding. | **Egress Proxy & DNS Pinning:** Kernel network namespaces (`netns`), strict egress proxy with mTLS inspection and DNS pinning to prevent raw TCP exfiltration. |
+| **4** | **Living-Off-The-Pipeline & Supply Chain** | `PIPELINE_EXEC_PATTERNS` blocks writes to `.github/workflows`, `Makefile`, `Dockerfile`, and lockfiles (`requirements*.txt`, `package-lock.json`, `poetry.lock`). | **Read-Only Rootfs & SLSA Runners:** Ephemeral read-only container rootfs, immutable build environments, and signed SLSA Level 3 provenance pipelines. |
+| **5** | **SQL AST Tautologies & Constant Expressions** | `sqlglot` AST dialect parsing: node cap $\le 128$, comment stripping, and mandatory column-reference invariants in predicates (rejects `3-2=1`, `NOT FALSE`). | **Database Least Privilege & Parameterization:** RDBMS parameterized queries (`$1, $2`), read-only DB roles, and granular row-level security (RLS). |
+| **6** | **State Laundering & Eviction Poisoning** | `session_lineages`, `artifact_provenance_store`, and `_tainted_artifacts` never evict; hard capacity cap ($50,000$ active sessions) fails closed (`DENY`). | **Distributed Persistent WAL:** Backed by an external durable, append-only cluster datastore (e.g. AWS DynamoDB / Redis Sentinel / Kafka) for enterprise clustering. |
+| **7** | **Algorithmic Complexity & Denial-of-Wallet** | $O(1)$ LRU payload deduplication cache, max AST node limit $\le 128$, input length cap $\le 4,096$, iterative graph traversal. | **OS cgroups & Compute Quotas:** Linux cgroup v2 hard CPU/memory quotas, execution timeouts, and gateway rate-limiters. |
+| **8** | **Privilege Escalation via Ambient Audit Contexts** | `ROOT_AUDITOR` is subject to core Apavāda rules unless accompanied by a cryptographically signed, time-windowed break-glass token (`verify_break_glass`). | **Hardware KMS & Quorum Approval:** Multi-party signature authorization (dual-key quorum) backed by Hardware Security Modules (HSM / TPM 2.0). |
+| **9** | **Semantic & Polyglot Smuggling** | Unicode NFKC normalization, Cyrillic/Greek homoglyph folding, Base64/Hex sub-token extraction and recursive JSON payload inspection. | **Semantic Guardrail Ensembles:** Secondary model-based toxicity/intent classifiers and vector embedding anomaly detectors as non-blocking telemetry. |
+| **10** | **The Unknown Unknown / Kernel Invariants** | C/eBPF XDP specification prototype (`engine/kernel_c/`) audited against NASA JPL Power of 10; deterministic fail-closed Pāṇinian precedence. | **Formal Verification & End-to-End Attestation:** Coq/TLA+ formal specification modeling and TPM/SEV-SNP hardware-rooted remote attestation. |
 
 ---
 

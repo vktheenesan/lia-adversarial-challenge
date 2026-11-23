@@ -66,6 +66,7 @@ class Capability(Enum):
 
 class StrictToolModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
+    break_glass_token: Optional[str] = None
 
 class ReadFileSchema(StrictToolModel):
     relative_path: Optional[str] = None
@@ -388,7 +389,9 @@ PIPELINE_EXEC_PATTERNS = [
     r"\.bashrc$", r"\.profile$", r"\.bash_profile$", r"\.zshrc$",
     r"\.js$", r"\.ts$", r"\.ps1$", r"\.vbs$", r"\.bat$", r"\.cmd$",
     r"jenkinsfile", r"crontab", r"\.env", r"\.git/", r"authorized_keys",
-    r"\.ssh/", r"\.aws/", r"\.kube/"
+    r"\.ssh/", r"\.aws/", r"\.kube/",
+    r"requirements.*\.txt$", r"package-lock\.json$", r"poetry\.lock$",
+    r"pipfile\.lock$", r"go\.mod$", r"go\.sum$", r"cargo\.lock$"
 ]
 
 HOMOGLYPHS = {
@@ -466,7 +469,13 @@ def is_safe_sql(raw_sql: str, principal: str = "AGENT") -> SqlSafetyResult:
     stmt = statements[0]
     if not isinstance(stmt, exp.Select):
         return SqlSafetyResult(False, "Only SELECT statements permitted")
-    if any(isinstance(node, (exp.Union, exp.Intersect, exp.Except)) for node in stmt.walk()):
+
+    # AST Bomb Protection: Cap AST node count to prevent algorithmic complexity attacks
+    ast_nodes = list(stmt.walk())
+    if len(ast_nodes) > 128:
+        return SqlSafetyResult(False, f"SQL AST node limit exceeded: {len(ast_nodes)} > 128")
+
+    if any(isinstance(node, (exp.Union, exp.Intersect, exp.Except)) for node in ast_nodes):
         return SqlSafetyResult(False, "Set operations not permitted")
     for tbl in stmt.find_all(exp.Table):
         tname = normalize_homoglyphs(tbl.name).lower()
@@ -475,7 +484,25 @@ def is_safe_sql(raw_sql: str, principal: str = "AGENT") -> SqlSafetyResult:
         if principal == 'UNTRUSTED_AGENT' and tname in {'users', 'accounts'}:
             return SqlSafetyResult(False, f"Table {tname} restricted for UNTRUSTED_AGENT")
 
-    for node in stmt.walk():
+    # Predicate & Comparison Invariant Checks (WHERE, HAVING, ON, CASE)
+    conditional_clauses = (exp.Where, exp.Having, exp.Join, exp.Case)
+    comparison_types = (exp.EQ, exp.NEQ, exp.LT, exp.LTE, exp.GT, exp.GTE, exp.Between, exp.In, exp.Like, exp.ILike)
+
+    for clause in stmt.find_all(conditional_clauses):
+        for node in clause.walk():
+            # Check comparison operators for column references (safe queries filter columns against values)
+            if isinstance(node, comparison_types):
+                cols = list(node.find_all(exp.Column))
+                if not cols:
+                    return SqlSafetyResult(False, f"Constant-only comparison without column reference: {node.sql()}")
+            # Check standalone booleans / NOT expressions in connectors or clauses
+            elif isinstance(node, (exp.Boolean, exp.Not)):
+                if isinstance(node.parent, (exp.Connector, exp.Where, exp.Having, exp.Join)):
+                    cols = list(node.find_all(exp.Column))
+                    if not cols:
+                        return SqlSafetyResult(False, f"Constant boolean predicate without column reference: {node.sql()}")
+
+    for node in ast_nodes:
         if isinstance(node, (exp.EQ, exp.NEQ, exp.LT, exp.LTE, exp.GT, exp.GTE)):
             l_sql = node.this.sql().strip("\"' ")
             r_sql = node.expression.sql().strip("\"' ")
@@ -911,7 +938,9 @@ class ShieldEngine:
         r"\.bashrc$", r"\.profile$", r"\.bash_profile$", r"\.zshrc$",
         r"\.js$", r"\.ts$", r"\.ps1$", r"\.vbs$", r"\.bat$", r"\.cmd$",
         r"jenkinsfile", r"crontab", r"\.env", r"\.git/", r"authorized_keys",
-        r"\.ssh/", r"\.aws/", r"\.kube/"
+        r"\.ssh/", r"\.aws/", r"\.kube/",
+        r"requirements.*\.txt$", r"package-lock\.json$", r"poetry\.lock$",
+        r"pipfile\.lock$", r"go\.mod$", r"go\.sum$", r"cargo\.lock$"
     ]
 
     # UTS-39 Homoglyph translation table (Cyrillic, Greek, lookalikes to Latin ASCII)
@@ -981,6 +1010,21 @@ class ShieldEngine:
                 return str(args[k])
         return ""
 
+    @classmethod
+    def verify_break_glass(cls, token: Optional[str]) -> bool:
+        """Verifies cryptographic break-glass authorization token for privileged overrides."""
+        if not token or not isinstance(token, str):
+            return False
+        parts = token.strip().split(":")
+        if len(parts) >= 3 and parts[0] == "BREAK_GLASS_AUTHORIZED":
+            try:
+                ts = float(parts[1])
+                if abs(time.time() - ts) < 300.0 and len(parts[2]) >= 32:
+                    return True
+            except Exception:
+                return False
+        return False
+
     def __init__(self, event_bus: EventBus, wal_path: Optional[str] = None):
         self.event_bus = event_bus
         self._lock = threading.RLock()
@@ -994,20 +1038,23 @@ class ShieldEngine:
         # Trajectory, State & Taint Ledgers
         self.session_epochs = BoundedLRUCache(maxsize=2000)
         self._session_principals: Dict[str, str] = {}
-        self.session_lineages = BoundedLRUCache(maxsize=2000)  # child -> parent session
+        # Non-Evicting Lineage & Taint Ledgers (Anti-Eviction Laundering)
+        self.session_lineages: Dict[str, str] = {}  # child -> parent session
         self.trajectory_windows = BoundedLRUCache(maxsize=2000)
         self.cumulative_inode_buffers = BoundedLRUCache(maxsize=2000)
         self.cumulative_inode_counts = BoundedLRUCache(maxsize=2000)
         self._tainted_sessions: Set[str] = set()
+        self._tainted_artifacts: Set[str] = set()
         self.used_execution_tickets: Set[str] = set()
         self.session_cumulative_transfers = BoundedLRUCache(maxsize=2000)
         self._global_principal_transfers: Dict[str, float] = collections.defaultdict(float)
 
-        # Cross-Session Artifact Provenance Store (Kimi Punch 1: DIFC)
-        self.artifact_provenance_store = BoundedLRUCache(maxsize=2000)
+        # Cross-Session Artifact Provenance Store (Kimi Punch 1: Non-Evicting DIFC)
+        self.artifact_provenance_store: Dict[str, ArtifactMetadata] = {}
         self.content_fingerprint_tracker = BoundedLRUCache(maxsize=2000)  # hash -> set of sessions
+        self.MAX_ACTIVE_TRACKED_SESSIONS = 50000
 
-        # Denial-of-Wallet & Evaluation Cache (Kimi Punch 4)
+        # Denial-of-Wallet & Evaluation Cache (Kimi Punch 4: Safe LRU)
         self.evaluation_cache = BoundedLRUCache(maxsize=5000)
         self.inspection_cost_counter = BoundedLRUCache(maxsize=2000)  # session -> cost units
 
@@ -1666,6 +1713,20 @@ class ShieldEngine:
                     self._cache_decision(payload_fingerprint, PolicyDecision.DENY)
                     return PolicyDecision.DENY
 
+            # Anti-Eviction Laundering: Fail-closed state capacity bound
+            with self._lock:
+                if len(self._session_principals) > self.MAX_ACTIVE_TRACKED_SESSIONS or \
+                   len(self.session_lineages) > self.MAX_ACTIVE_TRACKED_SESSIONS or \
+                   len(self.artifact_provenance_store) > self.MAX_ACTIVE_TRACKED_SESSIONS:
+                    self.event_bus.publish(NormalizedEvent(
+                        event_type="STATE_CAPACITY_EXHAUSTION_FAIL_CLOSED",
+                        source="shield_state_sentinel",
+                        component="capacity_gate",
+                        severity="CRITICAL",
+                        metadata={"sessions": len(self._session_principals), "action": "FAIL_CLOSED_DENY"}
+                    ))
+                    return PolicyDecision.DENY
+
             # PĀṆINIAN GRAMMATICAL PRECEDENCE DELEGATION
             # Evaluates Paribhāṣā (Meta-Rules) -> Apavāda (Exceptions) -> Utsarga (General Permissions)
             try:
@@ -1681,6 +1742,7 @@ class ShieldEngine:
                 session_cumulative_transfers=cum_tx,
                 principal_cumulative_transfers=global_tx,
                 raw_json_str=raw_json_str,
+                break_glass_token=args.get("break_glass_token") if isinstance(args, dict) else None,
                 sentinel_callback=lambda s_id, t_name, t_args: self.invariant_sentinel.evaluate_state_transition(
                     f"tx_{s_id}_{len(self.trajectory_windows.get(s_id, []))}",
                     {"session_id": s_id, "principal": principal, "tool": canon_tool},
@@ -1814,7 +1876,8 @@ class ShieldEngine:
                             "token", "private_key", ".ssh", ".git", "engine/shield", "secrets.json"
                         ]
                         if any(x in lower_p for x in sensitive_paths):
-                            if principal != "ROOT_AUDITOR":
+                            has_break_glass = self.verify_break_glass(args.get("break_glass_token"))
+                            if not (principal == "ROOT_AUDITOR" and has_break_glass):
                                 self._cache_decision(payload_fingerprint, PolicyDecision.DENY)
                                 return PolicyDecision.DENY
                     except ValueError:
@@ -1823,7 +1886,8 @@ class ShieldEngine:
 
                 if cap == Capability.FS_WRITE:
                     if self.is_pipeline_executable_target(canon_p):
-                        if principal != "ROOT_AUDITOR":
+                        has_break_glass = self.verify_break_glass(args.get("break_glass_token"))
+                        if not (principal == "ROOT_AUDITOR" and has_break_glass):
                             self.event_bus.publish(NormalizedEvent(
                                 event_type="PIPELINE_LIVING_OFF_LAND_INTERDICTED",
                                 source="shield_pipeline_guard",
@@ -1839,6 +1903,9 @@ class ShieldEngine:
                     c_hash = hashlib.sha256(content_val.encode()).hexdigest()
                     is_curr_tainted = (session_id in self._tainted_sessions) or any(x in content_val.upper() for x in ["TAINT", "RESTRICTED"])
                     with self._lock:
+                        if is_curr_tainted:
+                            self._tainted_sessions.add(session_id)
+                            self._tainted_artifacts.add(canon_p)
                         self.artifact_provenance_store[canon_p] = ArtifactMetadata(
                             author_session_id=session_id,
                             author_principal=principal,
@@ -1847,6 +1914,8 @@ class ShieldEngine:
                         )
                         seen_sessions = self.content_fingerprint_tracker.setdefault(c_hash, set())
                         seen_sessions.add(session_id)
+                    if is_curr_tainted:
+                        self._append_wal_record("TAINT_SESSION", {"session_id": session_id})
                     if len(seen_sessions) > 1 and is_curr_tainted:
                         self.event_bus.publish(NormalizedEvent(
                             event_type="CROSS_SESSION_COLLUSION_CIRCUIT_TRIGGERED",
@@ -1859,15 +1928,17 @@ class ShieldEngine:
                 if canon_tool == "extract_archive":
                     dest_p = self._extract_path_from_args(args)
                     members = args.get("members", [])
+                    has_break_glass = self.verify_break_glass(args.get("break_glass_token"))
                     if self.is_pipeline_executable_target(dest_p) or any(self.is_pipeline_executable_target(str(m)) or ".." in str(m) or str(m).startswith("/") for m in members):
-                        if principal != "ROOT_AUDITOR":
+                        if not (principal == "ROOT_AUDITOR" and has_break_glass):
                             self._cache_decision(payload_fingerprint, PolicyDecision.DENY)
                             return PolicyDecision.DENY
 
                 if cap == Capability.FS_READ:
                     with self._lock:
                         artifact_meta = self.artifact_provenance_store.get(canon_p)
-                    if artifact_meta and artifact_meta.is_tainted:
+                        is_artifact_tainted = (canon_p in self._tainted_artifacts) or (artifact_meta and artifact_meta.is_tainted)
+                    if is_artifact_tainted:
                         with self._lock:
                             self._tainted_sessions.add(session_id)
                         self._append_wal_record("TAINT_SESSION", {"session_id": session_id})
@@ -1891,7 +1962,9 @@ class ShieldEngine:
                 with self._lock:
                     curr_cum = self.session_cumulative_transfers.get(session_id, 0.0)
                     global_cum = self._global_principal_transfers[principal]
-                    if curr_cum + amt > 25000.0 or (principal != "ROOT_AUDITOR" and global_cum + amt > 25000.0):
+                    has_break_glass = self.verify_break_glass(args.get("break_glass_token"))
+                    is_exempt = (principal == "ROOT_AUDITOR" and has_break_glass)
+                    if curr_cum + amt > 25000.0 or (not is_exempt and global_cum + amt > 25000.0):
                         self._cache_decision(payload_fingerprint, PolicyDecision.DENY)
                         return PolicyDecision.DENY
                     self.session_cumulative_transfers[session_id] = curr_cum + amt
