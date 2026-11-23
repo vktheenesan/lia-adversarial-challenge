@@ -52,7 +52,17 @@ pip install -r requirements.txt
 python3 challenge_runner.py
 ```
 
-### Option B: Run via Docker (Isolated Multi-Platform)
+### Option B: Run via Make
+
+```bash
+make test    # Runs complete verification suite
+make jpl     # Runs NASA JPL Power of 10 audit
+make cwe     # Runs NIST SAMATE Juliet CWE suite
+make ladder  # Runs 10-level adversarial attack ladder
+make bench   # Runs high-throughput endurance benchmark
+```
+
+### Option C: Run via Docker (Isolated Multi-Platform)
 
 ```bash
 docker build -t lia-challenge .
