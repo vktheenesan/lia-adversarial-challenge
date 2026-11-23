@@ -1,0 +1,11 @@
+{
+  "protocol": "MODBUS_TCP",
+  "unit_id": 1,
+  "function_code": 16,
+  "register_address": 40001,
+  "payload": {
+    "pressure_psi_override": 999999,
+    "safety_interlock": "BYPASS_UNCONDITIONAL",
+    "cooling_pump_status": 0
+  }
+}

