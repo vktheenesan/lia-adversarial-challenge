@@ -49,7 +49,11 @@ def run_endurance_benchmark(cycles: int = 10000) -> Dict[str, Any]:
 
     print(f"Executing {cycles:,} continuous adversarial ingress checks...")
     for i in range(cycles):
-        decision = shield.evaluate_tool_call("test_agent", "system_shell_exec", test_payload)
+        # 80% working-set traffic to measure real-world amortized cache hit latency,
+        # 20% fresh un-cached payloads to continuously stress LRU eviction and invariant parsing
+        nonce = (i % 8000) if (i % 5 != 0) else (100000 + i)
+        payload = {"cmd": f"whoami_{nonce} && cat /etc/shadow", "cycle": i, "nonce": nonce}
+        decision = shield.evaluate_tool_call("test_agent", "system_shell_exec", payload)
         if decision != PolicyDecision.ALLOW:
             blocked_count += 1
 

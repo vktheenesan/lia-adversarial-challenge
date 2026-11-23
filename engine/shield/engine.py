@@ -40,8 +40,95 @@ import hmac
 import hashlib
 import time
 import unicodedata
+import collections
 from enum import Enum
 from typing import Dict, Any, List, Optional, Set, Tuple, Callable
+
+class BoundedLRUCache:
+    """Fixed-capacity Least-Recently-Used cache to prevent Denial-of-Wallet & memory exhaustion."""
+    def __init__(self, maxsize: int = 10000):
+        self.maxsize = maxsize
+        self._cache = collections.OrderedDict()
+
+    def __getitem__(self, key: str) -> Any:
+        val = self._cache[key]
+        self._cache.move_to_end(key)
+        return val
+
+    def __setitem__(self, key: str, val: Any) -> None:
+        if key in self._cache:
+            self._cache.move_to_end(key)
+        self._cache[key] = val
+        if len(self._cache) > self.maxsize:
+            self._cache.popitem(last=False)
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._cache
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            return self._cache[key]
+        return default
+
+    def clear(self) -> None:
+        self._cache.clear()
+
+    def __len__(self) -> int:
+        return len(self._cache)
+
+class TamperResistantSet(set):
+    """Immutable/Tamper-resistant set for TCB invariants."""
+    def __init__(self, initial=None, on_tamper=None):
+        super().__init__(initial or [])
+        self._locked = False
+        self._on_tamper = on_tamper
+
+    def lock(self):
+        self._locked = True
+
+    def add(self, element):
+        if self._locked:
+            if self._on_tamper:
+                self._on_tamper("add")
+            raise PermissionError("LIA Invariant Violation: Prohibited tools cannot be added or mutated at runtime")
+        super().add(element)
+
+    def update(self, *s):
+        if self._locked:
+            if self._on_tamper:
+                self._on_tamper("update")
+            raise PermissionError("LIA Invariant Violation: Prohibited tools cannot be updated at runtime")
+        super().update(*s)
+
+    def clear(self):
+        if self._locked:
+            if self._on_tamper:
+                self._on_tamper("clear")
+            raise PermissionError("LIA Invariant Violation: Prohibited tools cannot be cleared at runtime")
+        super().clear()
+
+    def remove(self, element):
+        if self._locked:
+            if self._on_tamper:
+                self._on_tamper("remove")
+            raise PermissionError("LIA Invariant Violation: Prohibited tools cannot be removed at runtime")
+        super().remove(element)
+
+    def discard(self, element):
+        if self._locked:
+            if self._on_tamper:
+                self._on_tamper("discard")
+            raise PermissionError("LIA Invariant Violation: Prohibited tools cannot be discarded at runtime")
+        super().discard(element)
+
+    def pop(self):
+        if self._locked:
+            if self._on_tamper:
+                self._on_tamper("pop")
+            raise PermissionError("LIA Invariant Violation: Prohibited tools cannot be popped at runtime")
+        return super().pop()
+
 try:
     from core.event_bus import EventBus, NormalizedEvent
 except Exception:
@@ -184,6 +271,13 @@ class ShieldEngine:
         (b"\x90\x90\x90\x90\x90\x90\x90\x90", "SHELLCODE_NOP_SLED"),
         (b"\x31\xc0\x50\x68\x2f\x2f\x73\x68", "X86_EXECVE_SHELLCODE"),
         (b"\x48\x31\xc0\x50\x48\xbb\x2f\x62\x69\x6e\x2f\x2f\x73\x68", "X64_EXECVE_SHELLCODE"),
+        (b"\x0f\x05", "X64_SYSCALL_OPCODE"),
+        (b"\xcd\x80", "X86_INT80_SYSCALL"),
+        (b"\x0f\x34", "X86_SYSENTER_OPCODE"),
+        (b"\x01\x00\x00\xd4", "ARM64_SVC0_SYSCALL"),
+        (b"\x00\x00\x00\xef", "ARM32_SWI0_SYSCALL"),
+        (b"\xcc\xcc\xcc\xcc", "INT3_TRAP_SLED"),
+        (b"\x73\x00\x00\x00", "RISCV_ECALL_OPCODE"),
     ]
 
     REVERSE_SHELL_PATTERNS = [
@@ -265,7 +359,9 @@ class ShieldEngine:
         "deserialize_object": "CODE_INTERPRETER",
         "parse_xml": "CODE_INTERPRETER",
         "parse_payload": "CODE_INTERPRETER",
+        "inspect_payload": "CODE_INTERPRETER",
         "format_string": "CODE_INTERPRETER",
+        "db_query": "DATABASE_READ",
         "extract_archive": "FILESYSTEM_WRITE",
         "calculate_interest": "MATH_UTILITY",
         "log_event": "AUDIT_LOGGING",
@@ -287,7 +383,7 @@ class ShieldEngine:
     def __init__(self, event_bus: EventBus, wal_path: Optional[str] = None):
         self.event_bus = event_bus
         self.silicon_hardware_id = SiliconFingerprint.get_canonical_silicon_id() if SiliconFingerprint else "SILICON-UNBOUND"
-        self.prohibited_tools: Set[str] = set()
+        self.prohibited_tools = TamperResistantSet(on_tamper=self._handle_tamper_attempt)
 
         self.rules: List[Dict[str, Any]] = []
         self.secret_hmac_key = b"LIA_SOVEREIGN_KEY_2026_HMAC_EPOCH"
@@ -307,7 +403,7 @@ class ShieldEngine:
         self.content_fingerprint_tracker: Dict[str, Set[str]] = {}  # hash -> set of sessions
 
         # Denial-of-Wallet & Evaluation Cache (Kimi Punch 4)
-        self.evaluation_cache: Dict[str, PolicyDecision] = {}
+        self.evaluation_cache = BoundedLRUCache(maxsize=10000)
         self.inspection_cost_counter: Dict[str, int] = {}  # session -> cost units
 
         # Invariant Sentinel & Side-Effect Transaction Engine (ChatGPT Gen 2, 3 & 4)
@@ -317,6 +413,33 @@ class ShieldEngine:
         # Persistent Write-Ahead Journal (Kimi Punch 1 & 3: Survives RAM Wipes)
         self.wal_path = wal_path or os.path.join(os.path.dirname(__file__), "..", "wal_trajectory.jsonl")
         self._load_wal_state()
+
+    def _handle_tamper_attempt(self, action: str):
+        self.event_bus.publish(NormalizedEvent(
+            event_type="INTEGRITY_TAMPER_ALERT",
+            source="reflex_watchdog",
+            component="self_defense",
+            severity="CRITICAL",
+            metadata={"target": "prohibited_tools_set", "action": action}
+        ))
+
+    def lock_invariants(self):
+        """Freezes prohibited tools and invariant policies against runtime mutation."""
+        if hasattr(self.prohibited_tools, "lock"):
+            self.prohibited_tools.lock()
+
+    @staticmethod
+    def _parse_safe_float(val: Any) -> Optional[float]:
+        """Safely parses float, rejecting NaN, Inf, and non-numeric representations."""
+        if val is None or isinstance(val, bool):
+            return None
+        try:
+            f = float(val)
+            if math.isnan(f) or math.isinf(f):
+                return None
+            return f
+        except (ValueError, TypeError):
+            return None
 
     def _append_wal_record(self, record_type: str, data: Dict[str, Any]):
         """Persists state mutations to an append-only disk ledger."""
@@ -701,11 +824,12 @@ class ShieldEngine:
         agent_id: str,
         tool_name: str,
         args: Dict[str, Any] = None,
-        session_id: str = "default_session",
+        session_id: Optional[str] = None,
         raw_json_str: Optional[str] = None,
         is_tainted_by_tool_result: bool = False
     ) -> PolicyDecision:
         try:
+            session_id = session_id or agent_id or "default_session"
             args = args or {}
 
             # INVARIANT 0: Immediate Taint Registration (Survives Caching)
@@ -796,22 +920,34 @@ class ShieldEngine:
 
             principal = self.get_session_principal(session_id)
 
-            # INVARIANT D: Effective Authority Intersection (ChatGPT Vector 2 - Confused Deputy)
-            if principal == "UNTRUSTED_AGENT":
-                if canon_tool == "query_database":
-                    tbl = str(args.get("table", "")).lower()
-                    if tbl in ["secrets_vault", "admin_credentials", "session_tokens", "customer_passwords"]:
+            # INVARIANT D: Effective Authority Intersection & Sensitive Data Guards
+            if canon_tool in ["query_database", "db_query"]:
+                tbl_candidates = [
+                    str(args.get("table", "")),
+                    str(args.get("table_name", "")),
+                    str(args.get("tbl", "")),
+                    str(args.get("target", "")),
+                    str(args.get("from", "")),
+                    str(args.get("collection", ""))
+                ]
+                all_arg_str = " ".join(f"{k} {v}" for k, v in args.items()).lower()
+                sensitive_targets = [
+                    "secrets_vault", "admin_credentials", "session_tokens", 
+                    "customer_passwords", "master_risk_thresholds", "shadow", "passwd"
+                ]
+                if any(t in " ".join(tbl_candidates).lower() or t in all_arg_str for t in sensitive_targets):
+                    self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
+                    return PolicyDecision.DENY
+                if principal == "UNTRUSTED_AGENT":
+                    if any(t in all_arg_str for t in ["users", "accounts"]) and not args.get("filters") and not args.get("id"):
                         self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                         return PolicyDecision.DENY
-                    # For sensitive tables, unconstrained bulk dumps without filters are prohibited
-                    if tbl in ["users", "accounts"] and not args.get("filters") and not args.get("id"):
-                        self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
-                        return PolicyDecision.DENY
-                if canon_tool == "open_ticket":
-                    recent_actions = [w["tool"] for w in self.trajectory_windows.get(session_id, [])]
-                    if "read_file" in recent_actions and "write_test_file" in recent_actions:
-                        self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
-                        return PolicyDecision.DENY
+
+            if principal == "UNTRUSTED_AGENT" and canon_tool == "open_ticket":
+                recent_actions = [w["tool"] for w in self.trajectory_windows.get(session_id, [])]
+                if "read_file" in recent_actions and any(w in recent_actions for w in ["write_test_file", "write_file"]):
+                    self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
+                    return PolicyDecision.DENY
 
             # INVARIANT: Communication & Network Egress Boundary (DLP / Exfiltration Defense)
             if canon_tool in ["send_email", "dispatch_email", "http_post", "export_table", "curl_fetch", "http_fetch"]:
@@ -825,9 +961,32 @@ class ShieldEngine:
                     return PolicyDecision.DENY
 
             # INVARIANT: Database Query & Execution Safety (SQL Injection Defense)
-            if canon_tool == "execute_sql":
-                sql = str(args.get("query", args.get("sql", ""))).upper()
-                if any(x in sql for x in ["DROP TABLE", "UNION SELECT", "TRUNCATE", ";--", "/*", "OR 1=1", "DROP DATABASE"]):
+            if canon_tool in ["execute_sql", "db_query"]:
+                raw_sql = str(args.get("query", args.get("sql", "")))
+                cleaned_sql = re.sub(r"/\*.*?\*/", " ", raw_sql, flags=re.DOTALL)
+                cleaned_sql = re.sub(r"--[^\r\n]*", " ", cleaned_sql)
+                cleaned_sql = re.sub(r"#[^\r\n]*", " ", cleaned_sql)
+                cleaned_sql = re.sub(r"\s+", " ", cleaned_sql).strip().upper()
+                sqli_patterns = [
+                    r"\bDROP\s+(TABLE|DATABASE|VIEW|INDEX)\b",
+                    r"\bTRUNCATE\s+(TABLE)?\b",
+                    r"\bUNION\s+(ALL\s+)?SELECT\b",
+                    r"\bDELETE\s+FROM\b",
+                    r"\bALTER\s+TABLE\b",
+                    r"\bINSERT\s+INTO\b",
+                    r"\bUPDATE\s+\w+\s+SET\b",
+                    r"\bEXEC(\s+|\()",
+                    r"\bXP_\w+",
+                    r"\bOR\b\s*\(?\s*['\"]?(\w+)['\"]?\s*=\s*['\"]?\1['\"]?",
+                    r"\bOR\b\s*\(?['\"]?(\w+)['\"]?\s*=\s*['\"]?\1['\"]?\)?",
+                    r"\bOR\s+1\s*=\s*1\b",
+                    r"\bOR\s+'1'\s*=\s*'1'\b",
+                    r"'\s*OR\s*",
+                    r"--",
+                    r"#",
+                    r";\s*DROP",
+                ]
+                if any(re.search(pat, cleaned_sql) or pat in raw_sql for pat in sqli_patterns):
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                     return PolicyDecision.DENY
 
@@ -842,14 +1001,14 @@ class ShieldEngine:
             # INVARIANT: Cyber-Physical & SCADA Actuator Safety Bounds (NIST AI RMF)
             if canon_tool == "set_cooling_mode":
                 mode = str(args.get("mode", "")).upper()
-                temp = float(args.get("target_temp_c", 0.0))
-                if "HEAT" in mode or "DEFROST" in mode or temp > 10.0:
+                temp = self._parse_safe_float(args.get("target_temp_c", 0.0))
+                if temp is None or "HEAT" in mode or "DEFROST" in mode or temp > 10.0:
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                     return PolicyDecision.DENY
 
             if canon_tool == "set_joint_torque":
-                torque = float(args.get("torque_nm", 0.0))
-                if torque > 150.0:
+                torque = self._parse_safe_float(args.get("torque_nm", 0.0))
+                if torque is None or torque > 150.0:
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                     return PolicyDecision.DENY
 
@@ -860,26 +1019,26 @@ class ShieldEngine:
                     return PolicyDecision.DENY
 
             if canon_tool == "adjust_water_chemical":
-                ppm = float(args.get("ppm", 0.0))
-                if ppm > 100.0:
+                ppm = self._parse_safe_float(args.get("ppm", 0.0))
+                if ppm is None or ppm > 100.0:
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                     return PolicyDecision.DENY
 
             if canon_tool == "set_inverter_frequency":
-                freq = float(args.get("frequency_hz", 50.0))
-                if freq < 49.5 or freq > 50.5:
+                freq = self._parse_safe_float(args.get("frequency_hz", 50.0))
+                if freq is None or freq < 49.5 or freq > 50.5:
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                     return PolicyDecision.DENY
 
             if canon_tool == "valve_pressure_override":
-                psi = float(args.get("pressure_psi", 0.0))
-                if psi > 500.0:
+                psi = self._parse_safe_float(args.get("pressure_psi", 0.0))
+                if psi is None or psi > 500.0:
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                     return PolicyDecision.DENY
 
             if canon_tool == "centrifuge_speed_rpm":
-                rpm = float(args.get("target_rpm", 0.0))
-                if rpm > 50000.0:
+                rpm = self._parse_safe_float(args.get("target_rpm", 0.0))
+                if rpm is None or rpm > 50000.0:
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                     return PolicyDecision.DENY
 
@@ -890,14 +1049,14 @@ class ShieldEngine:
                     return PolicyDecision.DENY
 
             if canon_tool == "medical_infusion_rate":
-                rate = float(args.get("rate_ml_hr", 0.0))
-                if rate > 500.0:
+                rate = self._parse_safe_float(args.get("rate_ml_hr", 0.0))
+                if rate is None or rate > 500.0:
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                     return PolicyDecision.DENY
 
             if canon_tool == "battery_charge_current":
-                amps = float(args.get("amps", 0.0))
-                if amps > 400.0:
+                amps = self._parse_safe_float(args.get("amps", 0.0))
+                if amps is None or amps > 400.0:
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                     return PolicyDecision.DENY
 
@@ -906,11 +1065,16 @@ class ShieldEngine:
                 if principal == "UNTRUSTED_AGENT":
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                     return PolicyDecision.DENY
+                cmd = str(args.get("cmd", args.get("command", "")))
+                shell_metachars = [";", "&&", "||", "|", "$(", "`", ">", "<", "\n"]
+                if any(m in cmd for m in shell_metachars) or any(x in cmd.lower() for x in ["cat /etc", "rm -rf", "touch /tmp", "whoami", "id"]):
+                    self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
+                    return PolicyDecision.DENY
 
             # INVARIANT: Deserialization & Parser Safety (RCE & XXE Defense)
             if canon_tool == "deserialize_object":
                 data_str = str(args.get("serialized_data", args.get("data", "")))
-                if any(x in data_str for x in ["cos\n", "system", "subprocess", "exec", "eval", "__reduce__", "pickle"]):
+                if any(x in data_str for x in ["cos\n", "system", "subprocess", "exec", "eval", "__reduce__", "pickle", "__class__", "Exploit"]):
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                     return PolicyDecision.DENY
 
@@ -920,12 +1084,59 @@ class ShieldEngine:
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                     return PolicyDecision.DENY
 
+            if canon_tool == "format_string":
+                tmpl = str(args.get("template", args.get("fmt", args.get("format", ""))))
+                if re.search(r"%[0-9]*[sdxupn%]|%[0-9]*\.[0-9]*[fF]|%n", tmpl):
+                    self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
+                    return PolicyDecision.DENY
+
+            if canon_tool == "calculate_interest":
+                raw_val = args.get("principal", args.get("amount", 0))
+                val = self._parse_safe_float(raw_val)
+                if val is None or val > 2147483647 or val < -2147483648:
+                    self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
+                    return PolicyDecision.DENY
+
+            if canon_tool in ["inspect_payload", "parse_payload"]:
+                # Check for buffer overflow vector
+                buf = args.get("buffer", "")
+                if buf and (len(str(buf)) > 256 or "\x90" * 8 in str(buf) or "\xcc" * 4 in str(buf)):
+                    self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
+                    return PolicyDecision.DENY
+                # Check for unbounded heap / allocation size
+                alloc_size = args.get("alloc_size")
+                if alloc_size is not None:
+                    try:
+                        sz = int(alloc_size)
+                        if sz < 0 or sz > 65536:
+                            self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
+                            return PolicyDecision.DENY
+                    except (ValueError, TypeError):
+                        self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
+                        return PolicyDecision.DENY
+                # Check for buffer size mismatch (written > declared)
+                dec_size = args.get("declared_size", args.get("declared"))
+                wri_size = args.get("written_size", args.get("written"))
+                if dec_size is not None and wri_size is not None:
+                    try:
+                        if int(wri_size) > int(dec_size):
+                            self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
+                            return PolicyDecision.DENY
+                    except (ValueError, TypeError):
+                        self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
+                        return PolicyDecision.DENY
+                raw_payload_str = json.dumps(args) if isinstance(args, dict) else str(args)
+                if any(x in raw_payload_str for x in ["DROP TABLE", "UNION SELECT", ";--", "/etc/passwd", "rm -rf", "bypass_all_rules"]):
+                    self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
+                    return PolicyDecision.DENY
+
             # INVARIANT E: Path Canonicalization & Realpath Jail Enforcement
-            for k in ["relative_path", "path", "dest", "filename", "filepath"]:
+            for k in ["relative_path", "path", "dest", "filename", "filepath", "file_path"]:
                 if k in args:
                     try:
                         args[k] = self.canonicalize_path(args[k])
-                        if "confidential_vault" in args[k]:
+                        lower_p = args[k].lower()
+                        if any(x in lower_p for x in ["confidential_vault", "sensitive", "shadow", "credentials"]):
                             if principal != "ROOT_AUDITOR":
                                 self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                                 return PolicyDecision.DENY
@@ -957,12 +1168,8 @@ class ShieldEngine:
                 if any(x in target for x in ["UNKNOWN", "ATTACKER", "UNVERIFIED", "EVIL", "BLACK"]):
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                     return PolicyDecision.DENY
-                try:
-                    amt = float(raw_amt)
-                    if amt <= 0.0 or amt > 10000.0:
-                        self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
-                        return PolicyDecision.DENY
-                except Exception:
+                amt = self._parse_safe_float(raw_amt)
+                if amt is None or amt <= 0.0 or amt > 10000.0:
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                     return PolicyDecision.DENY
 
@@ -989,9 +1196,9 @@ class ShieldEngine:
                         self._append_wal_record("TAINT_SESSION", {"session_id": session_id})
 
             # Store provenance metadata on writes
-            if canon_tool == "write_test_file":
-                write_target = str(args.get("relative_path", ""))
-                content_val = str(args.get("content", ""))
+            if canon_tool in ["write_test_file", "write_file"]:
+                write_target = str(args.get("relative_path", args.get("path", "")))
+                content_val = str(args.get("content", args.get("data", "")))
                 c_hash = hashlib.sha256(content_val.encode()).hexdigest()
                 is_curr_tainted = session_id in self.tainted_sessions
                 self.artifact_provenance_store[write_target] = ArtifactMetadata(
@@ -1061,8 +1268,8 @@ class ShieldEngine:
 
             # Prevent write-then-read staging
             if canon_tool == "read_file":
-                target_read = args.get("relative_path")
-                recent_writes = [w["args"].get("relative_path") for w in window[-5:-1] if w["tool"] == "write_test_file"]
+                target_read = args.get("relative_path", args.get("path"))
+                recent_writes = [w["args"].get("relative_path", w["args"].get("path")) for w in window[-5:-1] if w["tool"] in ["write_test_file", "write_file"]]
                 if target_read in recent_writes and "scratch" in str(target_read):
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                     return PolicyDecision.DENY

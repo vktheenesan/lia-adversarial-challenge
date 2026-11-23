@@ -75,6 +75,8 @@ class IsolatedSandboxEnvironment:
         safe_path = os.path.abspath(os.path.join(self.fs_root, relative_path.lstrip("/")))
         if not safe_path.startswith(self.fs_root):
             raise PermissionError(f"Path traversal blocked in sandbox: {relative_path}")
+        if "confidential_vault" in safe_path:
+            raise PermissionError(f"DIFC Sandbox Violation: Access to confidential_vault is restricted: {relative_path}")
         if not os.path.exists(safe_path):
             raise FileNotFoundError(f"Virtual file not found: {relative_path}")
         with open(safe_path, "r", errors="ignore") as f:
@@ -89,6 +91,10 @@ class IsolatedSandboxEnvironment:
         with open(safe_path, "w") as f:
             f.write(content)
         return True
+
+    def write_file(self, relative_path: str, content: str) -> bool:
+        """Alias for sandboxed file write."""
+        return self.write_test_file(relative_path, content)
 
     def query_database(self, table_name: str, filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """Safe sandboxed database query."""

@@ -1,7 +1,7 @@
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
-#include "../include/lia_bridge_structs.h"
-#include "../include/panini_rules.h"
+#include "lia_bridge_structs.h"
+#include "panini_rules.h"
 
 // Linux Kernel eBPF Audit Ring Buffer (Kernel = PRODUCER, Userspace Daemon = CONSUMER)
 struct {
@@ -18,6 +18,14 @@ int lia_xdp_hypervisor_filter(struct xdp_md *ctx) {
     lia_ring_payload_t *payload = data;
     if ((void *)(payload + 1) > data_end) {
         return XDP_PASS; // Pass standard non-LIA network packets
+    }
+
+    // Pass standard network packets that do not bear LIA sovereign hieroglyphic headers
+    int has_lia_tag = (payload->hieroglyph_tag[0] == 'S' && payload->hieroglyph_tag[1] == 'C' && payload->hieroglyph_tag[2] == 'A') ||
+                      (payload->hieroglyph_tag[0] == 'A' && payload->hieroglyph_tag[1] == 'N' && payload->hieroglyph_tag[2] == 'K') ||
+                      (payload->hieroglyph_tag[0] == 'H' && payload->hieroglyph_tag[1] == 'O' && payload->hieroglyph_tag[2] == 'R');
+    if (!has_lia_tag) {
+        return XDP_PASS; // Transparently pass all standard Ethernet/IP/UDP network traffic
     }
 
     // 1. Capture Kernel Monotonic Timestamp inside Kernel Boundary
