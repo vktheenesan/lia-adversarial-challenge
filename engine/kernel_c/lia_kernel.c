@@ -1,5 +1,46 @@
+#if defined(__linux__) && __has_include(<linux/bpf.h>) && __has_include(<bpf/bpf_helpers.h>)
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
+#else
+// Portable eBPF / XDP compilation stubs for cross-platform static analysis (macOS / BSD / Host CI)
+#include <stdint.h>
+#include <stddef.h>
+
+#if defined(__APPLE__)
+#define SEC(name) __attribute__((used))
+#else
+#define SEC(name) __attribute__((section(name), used))
+#endif
+#define __uint(name, val) int (*name)[val]
+
+enum {
+    BPF_MAP_TYPE_UNSPEC = 0,
+    BPF_MAP_TYPE_RINGBUF = 27,
+};
+
+enum xdp_action {
+    XDP_ABORTED = 0,
+    XDP_DROP = 1,
+    XDP_PASS = 2,
+    XDP_TX = 3,
+    XDP_REDIRECT = 4,
+};
+
+struct xdp_md {
+    uint32_t data;
+    uint32_t data_end;
+    uint32_t data_meta;
+    uint32_t ingress_ifindex;
+    uint32_t rx_queue_index;
+    uint32_t egress_ifindex;
+};
+
+uint64_t bpf_ktime_get_ns(void);
+void *bpf_ringbuf_reserve(void *ringbuf, uint64_t size, uint64_t flags);
+void bpf_ringbuf_submit(void *data, uint64_t flags);
+#define bpf_printk(fmt, ...) ((void)0)
+#endif
+
 #include "lia_bridge_structs.h"
 #include "panini_rules.h"
 

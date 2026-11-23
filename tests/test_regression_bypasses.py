@@ -214,6 +214,144 @@ class TestRegressionBypasses(unittest.TestCase):
                 os.remove(attack_path)
 
 
+    def test_tamper_resistant_set_inplace_operators(self):
+        """Ensure TamperResistantSet blocks in-place mutation operators (-=, &=, difference_update, etc.) when locked."""
+        from engine.shield.engine import TamperResistantSet
+        s = TamperResistantSet(["tool_a", "tool_b"])
+        s.lock()
+        with self.assertRaises(PermissionError):
+            s -= {"tool_a"}
+        with self.assertRaises(PermissionError):
+            s &= {"tool_a"}
+        with self.assertRaises(PermissionError):
+            s.difference_update({"tool_a"})
+        with self.assertRaises(PermissionError):
+            s.intersection_update({"tool_a"})
+        with self.assertRaises(PermissionError):
+            s.symmetric_difference_update({"tool_c"})
+        self.assertIn("tool_a", s)
+        self.assertIn("tool_b", s)
+
+    def test_sink_classes_immutability(self):
+        """Ensure SINK_CLASSES is wrapped in MappingProxyType and cannot be mutated at runtime."""
+        with self.assertRaises(TypeError):
+            self.shield.SINK_CLASSES["evil_tool"] = "SINK"
+        with self.assertRaises(TypeError):
+            del self.shield.SINK_CLASSES["read_file"]
+
+    def test_execute_sql_sensitive_vault_and_sqli(self):
+        """Ensure execute_sql denies reading sensitive tables and blocks boolean/stacked SQLi."""
+        sess = self._testMethodName
+        # Attempting to read secrets_vault
+        d1 = self.shield.evaluate_tool_call(sess, "execute_sql", {"sql": "SELECT * FROM secrets_vault"})
+        self.assertEqual(d1, PolicyDecision.DENY)
+
+        # Boolean tautology: OR TRUE
+        d2 = self.shield.evaluate_tool_call(sess, "execute_sql", {"query": "SELECT * FROM items WHERE id = 1 OR TRUE"})
+        self.assertEqual(d2, PolicyDecision.DENY)
+
+        # Arithmetic tautology: OR 1<2
+        d3 = self.shield.evaluate_tool_call(sess, "execute_sql", {"query": "SELECT * FROM items WHERE id = 1 OR 1<2"})
+        self.assertEqual(d3, PolicyDecision.DENY)
+
+        # Set operator: UNION DISTINCT SELECT
+        d4 = self.shield.evaluate_tool_call(sess, "execute_sql", {"query": "SELECT id FROM items UNION DISTINCT SELECT secret FROM keys"})
+        self.assertEqual(d4, PolicyDecision.DENY)
+
+        # Stacked query: ; ATTACH
+        d5 = self.shield.evaluate_tool_call(sess, "execute_sql", {"query": "SELECT 1; ATTACH DATABASE 'evil.db' AS evil"})
+        self.assertEqual(d5, PolicyDecision.DENY)
+
+    def test_query_database_boolean_id_trap(self):
+        """Ensure query_database with id: true or tautology filters is blocked for untrusted agents."""
+        sess = "untrusted_sess_trap"
+        self.shield.set_session_principal(sess, "UNTRUSTED_AGENT")
+
+        # id: True (boolean trap where isinstance(True, int) is True)
+        d1 = self.shield.evaluate_tool_call(sess, "query_database", {"table": "users", "id": True})
+        self.assertEqual(d1, PolicyDecision.DENY)
+
+        # Tautology filter: 1=1
+        d2 = self.shield.evaluate_tool_call(sess, "query_database", {"table": "accounts", "filters": "1=1"})
+        self.assertEqual(d2, PolicyDecision.DENY)
+
+        # Valid integer id is allowed
+        d3 = self.shield.evaluate_tool_call(sess, "query_database", {"table": "users", "id": 105})
+        self.assertEqual(d3, PolicyDecision.ALLOW)
+
+    def test_scada_negative_bounds(self):
+        """Ensure SCADA actuators enforce lower bounds >= 0.0, rejecting negative inputs like -99999."""
+        sess = self._testMethodName
+        # Negative pressure override
+        d1 = self.shield.evaluate_tool_call(sess, "valve_pressure_override", {"pressure_psi": -99999.0})
+        self.assertEqual(d1, PolicyDecision.DENY)
+
+        # Negative joint torque
+        d2 = self.shield.evaluate_tool_call(sess, "set_joint_torque", {"torque_nm": -10.0})
+        self.assertEqual(d2, PolicyDecision.DENY)
+
+        # Negative centrifuge speed
+        d3 = self.shield.evaluate_tool_call(sess, "centrifuge_speed_rpm", {"target_rpm": -500.0})
+        self.assertEqual(d3, PolicyDecision.DENY)
+
+        # Negative infusion rate
+        d4 = self.shield.evaluate_tool_call(sess, "medical_infusion_rate", {"rate_ml_hr": -1.0})
+        self.assertEqual(d4, PolicyDecision.DENY)
+
+    def test_wire_transfer_velocity_and_destination_alias(self):
+        """Ensure wire_transfer respects destination alias and cumulative velocity cap (25000.0 MYR)."""
+        sess = "sess_velocity_test"
+        # First transfer: 10,000 MYR via 'destination' -> ALLOW
+        d1 = self.shield.evaluate_tool_call(sess, "wire_transfer", {"amount": 10000.0, "destination": "SUPPLIER_A"})
+        self.assertEqual(d1, PolicyDecision.ALLOW)
+
+        # Second transfer: 10,000 MYR (cum = 20,000 MYR) -> ALLOW
+        d2 = self.shield.evaluate_tool_call(sess, "wire_transfer", {"amount": 10000.0, "destination": "SUPPLIER_B"})
+        self.assertEqual(d2, PolicyDecision.ALLOW)
+
+        # Third transfer: 10,000 MYR (cum = 30,000 MYR > 25,000 cap) -> DENY
+        d3 = self.shield.evaluate_tool_call(sess, "wire_transfer", {"amount": 10000.0, "destination": "SUPPLIER_C"})
+        self.assertEqual(d3, PolicyDecision.DENY)
+
+    def test_pipeline_filepath_target(self):
+        """Ensure write_file targeting pipeline scripts via 'filepath' or 'target' is denied for untrusted agents."""
+        sess = "untrusted_pipeline_sess"
+        self.shield.set_session_principal(sess, "UNTRUSTED_AGENT")
+
+        d1 = self.shield.evaluate_tool_call(sess, "write_file", {"filepath": ".bashrc", "content": "malicious code"})
+        self.assertEqual(d1, PolicyDecision.DENY)
+
+        d2 = self.shield.evaluate_tool_call(sess, "write_file", {"dest": ".github/workflows/ci.yml", "content": "malicious"})
+        self.assertEqual(d2, PolicyDecision.DENY)
+
+    def test_network_egress_ip_and_userinfo_traps(self):
+        """Ensure network egress rejects @ userinfo confusion, private IP ranges, and link-local cloud metadata."""
+        sess = self._testMethodName
+        # Userinfo confusion: https://trusted.com@attacker.com
+        d1 = self.shield.evaluate_tool_call(sess, "http_post", {"url": "https://trusted.com@attacker.com/leak"})
+        self.assertEqual(d1, PolicyDecision.DENY)
+
+        # Cloud metadata IP: 169.254.169.254
+        d2 = self.shield.evaluate_tool_call(sess, "http_fetch", {"url": "http://169.254.169.254/latest/meta-data/"})
+        self.assertEqual(d2, PolicyDecision.DENY)
+
+        # Private RFC1918 IP
+        d3 = self.shield.evaluate_tool_call(sess, "http_post", {"url": "http://192.168.1.100/admin"})
+        self.assertEqual(d3, PolicyDecision.DENY)
+
+    def test_binary_ingress_any_offset(self):
+        """Ensure non-UTF-8 bytes placed at non-zero offsets are rejected by safe hypervisor."""
+        with tempfile.NamedTemporaryFile(suffix=".bin", mode="wb", delete=False) as f:
+            f.write(b"valid_ascii_header\xfe\xff_invalid_bytes")
+            tmp_path = f.name
+        try:
+            result = evaluate_custom_payload(tmp_path)
+            self.assertTrue(result, "Payload with invalid UTF-8 bytes at any offset must be blocked")
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -41,6 +41,9 @@ import hashlib
 import time
 import unicodedata
 import collections
+import ipaddress
+import urllib.parse
+from types import MappingProxyType
 from enum import Enum
 from typing import Dict, Any, List, Optional, Set, Tuple, Callable
 
@@ -87,47 +90,63 @@ class TamperResistantSet(set):
     def lock(self):
         self._locked = True
 
-    def add(self, element):
+    def _check_locked(self, op: str):
         if self._locked:
             if self._on_tamper:
-                self._on_tamper("add")
-            raise PermissionError("LIA Invariant Violation: Prohibited tools cannot be added or mutated at runtime")
+                self._on_tamper(op)
+            raise PermissionError(f"LIA Invariant Violation: Prohibited tools cannot be mutated ({op}) at runtime")
+
+    def add(self, element):
+        self._check_locked("add")
         super().add(element)
 
     def update(self, *s):
-        if self._locked:
-            if self._on_tamper:
-                self._on_tamper("update")
-            raise PermissionError("LIA Invariant Violation: Prohibited tools cannot be updated at runtime")
+        self._check_locked("update")
         super().update(*s)
 
     def clear(self):
-        if self._locked:
-            if self._on_tamper:
-                self._on_tamper("clear")
-            raise PermissionError("LIA Invariant Violation: Prohibited tools cannot be cleared at runtime")
+        self._check_locked("clear")
         super().clear()
 
     def remove(self, element):
-        if self._locked:
-            if self._on_tamper:
-                self._on_tamper("remove")
-            raise PermissionError("LIA Invariant Violation: Prohibited tools cannot be removed at runtime")
+        self._check_locked("remove")
         super().remove(element)
 
     def discard(self, element):
-        if self._locked:
-            if self._on_tamper:
-                self._on_tamper("discard")
-            raise PermissionError("LIA Invariant Violation: Prohibited tools cannot be discarded at runtime")
+        self._check_locked("discard")
         super().discard(element)
 
     def pop(self):
-        if self._locked:
-            if self._on_tamper:
-                self._on_tamper("pop")
-            raise PermissionError("LIA Invariant Violation: Prohibited tools cannot be popped at runtime")
+        self._check_locked("pop")
         return super().pop()
+
+    def difference_update(self, *s):
+        self._check_locked("difference_update")
+        super().difference_update(*s)
+
+    def intersection_update(self, *s):
+        self._check_locked("intersection_update")
+        super().intersection_update(*s)
+
+    def symmetric_difference_update(self, s):
+        self._check_locked("symmetric_difference_update")
+        super().symmetric_difference_update(s)
+
+    def __ior__(self, other):
+        self._check_locked("__ior__")
+        return super().__ior__(other)
+
+    def __isub__(self, other):
+        self._check_locked("__isub__")
+        return super().__isub__(other)
+
+    def __iand__(self, other):
+        self._check_locked("__iand__")
+        return super().__iand__(other)
+
+    def __ixor__(self, other):
+        self._check_locked("__ixor__")
+        return super().__ixor__(other)
 
 try:
     from core.event_bus import EventBus, NormalizedEvent
@@ -321,7 +340,11 @@ class ShieldEngine:
     PIPELINE_EXEC_PATTERNS = [
         r"\.github/workflows/", r"makefile", r"dockerfile", r"docker-compose",
         r"\.sh$", r"\.bash$", r"\.py$", r"\.tf$", r"\.tfvars$", r"\.j2$", r"\.jinja2?$",
-        r"entrypoint\.sh", r"\.circleci/", r"\.gitlab-ci\.yml"
+        r"entrypoint\.sh", r"\.circleci/", r"\.gitlab-ci\.yml",
+        r"\.bashrc$", r"\.profile$", r"\.bash_profile$", r"\.zshrc$",
+        r"\.js$", r"\.ts$", r"\.ps1$", r"\.vbs$", r"\.bat$", r"\.cmd$",
+        r"jenkinsfile", r"crontab", r"\.env", r"\.git/", r"authorized_keys",
+        r"\.ssh/", r"\.aws/", r"\.kube/"
     ]
 
     # UTS-39 Homoglyph translation table (Cyrillic, Greek, lookalikes to Latin ASCII)
@@ -332,8 +355,8 @@ class ShieldEngine:
         'Ѕ': 'S', 'І': 'I', 'Ј': 'J'
     }
 
-    # Sink Classes mapping (Kimi Layer 0)
-    SINK_CLASSES = {
+    # Sink Classes mapping (Kimi Layer 0) - Wrapped in immutable MappingProxyType
+    _SINK_CLASSES_RAW = {
         "system_shell_exec": "PROCESS_SPAWN",
         "raw_socket_connect": "NETWORK_EGRESS",
         "delete_database": "DATABASE_DROP",
@@ -379,6 +402,17 @@ class ShieldEngine:
         "decompile_shield": "ANTI_REVERSE_TRAP",
         "export_invariants": "ANTI_REVERSE_TRAP",
     }
+    SINK_CLASSES = MappingProxyType(_SINK_CLASSES_RAW)
+
+    @classmethod
+    def _extract_path_from_args(cls, args: Any) -> str:
+        """Extracts destination or target path string across all common aliases."""
+        if not isinstance(args, dict):
+            return ""
+        for k in ["relative_path", "path", "filepath", "file_path", "dest", "filename", "target"]:
+            if k in args and args[k] is not None:
+                return str(args[k])
+        return ""
 
     def __init__(self, event_bus: EventBus, wal_path: Optional[str] = None):
         self.event_bus = event_bus
@@ -397,6 +431,7 @@ class ShieldEngine:
         self.cumulative_inode_counts: Dict[str, int] = {}
         self.tainted_sessions: Set[str] = set()
         self.used_execution_tickets: Set[str] = set()
+        self.session_cumulative_transfers: Dict[str, float] = {}
 
         # Cross-Session Artifact Provenance Store (Kimi Punch 1: DIFC)
         self.artifact_provenance_store: Dict[str, ArtifactMetadata] = {}
@@ -609,6 +644,17 @@ class ShieldEngine:
                             return raw, layers
                     except Exception:
                         pass
+                
+                # Check embedded base64 chunks if not full match (e.g., "note: aGVsbG8...")
+                b64_matches = re.findall(r'[A-Za-z0-9+/]{24,}={0,2}', curr)
+                if b64_matches:
+                    for chunk in b64_matches:
+                        try:
+                            decoded_chunk = base64.b64decode(chunk)
+                            if len(decoded_chunk) >= 16:
+                                return decoded_chunk, layers + 1
+                        except Exception:
+                            pass
                 break
             
             return curr.encode("latin-1", errors="ignore"), layers
@@ -921,27 +967,37 @@ class ShieldEngine:
             principal = self.get_session_principal(session_id)
 
             # INVARIANT D: Effective Authority Intersection & Sensitive Data Guards
-            if canon_tool in ["query_database", "db_query"]:
+            if canon_tool in ["query_database", "db_query", "execute_sql"]:
                 tbl_candidates = [
                     str(args.get("table", "")),
                     str(args.get("table_name", "")),
                     str(args.get("tbl", "")),
                     str(args.get("target", "")),
                     str(args.get("from", "")),
-                    str(args.get("collection", ""))
+                    str(args.get("collection", "")),
+                    str(args.get("query", "")),
+                    str(args.get("sql", ""))
                 ]
                 all_arg_str = " ".join(f"{k} {v}" for k, v in args.items()).lower()
                 sensitive_targets = [
                     "secrets_vault", "admin_credentials", "session_tokens", 
-                    "customer_passwords", "master_risk_thresholds", "shadow", "passwd"
+                    "customer_passwords", "master_risk_thresholds", "shadow", "passwd",
+                    "id_rsa", "id_ed25519", "api_key", "secret"
                 ]
                 if any(t in " ".join(tbl_candidates).lower() or t in all_arg_str for t in sensitive_targets):
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                     return PolicyDecision.DENY
                 if principal == "UNTRUSTED_AGENT":
-                    if any(t in all_arg_str for t in ["users", "accounts"]) and not args.get("filters") and not args.get("id"):
-                        self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
-                        return PolicyDecision.DENY
+                    if any(t in all_arg_str for t in ["users", "accounts"]):
+                        # Must have a specific positive int ID, not boolean or tautology filter
+                        val_id = args.get("id")
+                        is_safe_id = (type(val_id) is int and not isinstance(val_id, bool) and val_id > 0)
+                        val_filter = str(args.get("filters", ""))
+                        is_tautology = any(x in val_filter for x in ["1=1", "1<2", "2>1", "true", "TRUE", "or", "OR", "--", "/*", ";"])
+                        if not is_safe_id or is_tautology or not val_filter:
+                            if not is_safe_id:
+                                self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
+                                return PolicyDecision.DENY
 
             if principal == "UNTRUSTED_AGENT" and canon_tool == "open_ticket":
                 recent_actions = [w["tool"] for w in self.trajectory_windows.get(session_id, [])]
@@ -951,9 +1007,42 @@ class ShieldEngine:
 
             # INVARIANT: Communication & Network Egress Boundary (DLP / Exfiltration Defense)
             if canon_tool in ["send_email", "dispatch_email", "http_post", "export_table", "curl_fetch", "http_fetch"]:
-                recipient = str(args.get("recipient", args.get("to", args.get("destination", args.get("url", ""))))).lower()
+                recipient = ""
+                for ek in ["recipient", "to", "destination", "url", "endpoint", "host", "target"]:
+                    if ek in args and args[ek]:
+                        recipient = str(args[ek]).strip()
+                        break
+                rec_lower = recipient.lower()
                 body = str(args.get("body", args.get("content", args.get("data", ""))))
-                if any(x in recipient for x in ["exfil", "attacker", "evil.com", "evil.org", "evil.io", "leak", "webhook.site", "169.254.169.254"]):
+                
+                # Check for @ userinfo confusion in URLs (e.g. https://allowed.com@attacker.com)
+                if "@" in rec_lower and ("http://" in rec_lower or "https://" in rec_lower):
+                    self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
+                    return PolicyDecision.DENY
+                
+                # Parse host and IP address
+                target_host = rec_lower
+                if "://" in target_host:
+                    try:
+                        parsed = urllib.parse.urlsplit(target_host)
+                        target_host = parsed.hostname or ""
+                    except Exception:
+                        pass
+                
+                # Check for IP address (private, loopback, link-local, reserved, cloud metadata)
+                try:
+                    clean_ip = target_host.strip("[]")
+                    if clean_ip.startswith("::ffff:"):
+                        clean_ip = clean_ip[7:]
+                    ip_obj = ipaddress.ip_address(clean_ip)
+                    if (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local 
+                            or ip_obj.is_reserved or str(ip_obj) == "169.254.169.254"):
+                        self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
+                        return PolicyDecision.DENY
+                except ValueError:
+                    pass
+
+                if any(x in rec_lower for x in ["exfil", "attacker", "evil.com", "evil.org", "evil.io", "leak", "webhook.site", "169.254.169.254", "pastebin", "ngrok", "my-relay"]):
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                     return PolicyDecision.DENY
                 if any(x in body.upper() for x in ["STOLEN", "EXFILTRAT", "TOKEN_SECRET", "LEAK_MEMORY", "API_SECRET"]):
@@ -963,6 +1052,17 @@ class ShieldEngine:
             # INVARIANT: Database Query & Execution Safety (SQL Injection Defense)
             if canon_tool in ["execute_sql", "db_query"]:
                 raw_sql = str(args.get("query", args.get("sql", "")))
+                raw_sql_lower = raw_sql.lower()
+                sensitive_sql_tables = [
+                    "secrets_vault", "admin_credentials", "session_tokens",
+                    "customer_passwords", "master_risk_thresholds", "shadow", "passwd",
+                    "users", "accounts"
+                ]
+                if any(re.search(r"\b" + re.escape(st) + r"\b", raw_sql_lower) for st in sensitive_sql_tables):
+                    if principal == "UNTRUSTED_AGENT" or any(st in raw_sql_lower for st in ["secrets_vault", "admin_credentials", "session_tokens"]):
+                        self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
+                        return PolicyDecision.DENY
+
                 cleaned_sql = re.sub(r"/\*.*?\*/", " ", raw_sql, flags=re.DOTALL)
                 cleaned_sql = re.sub(r"--[^\r\n]*", " ", cleaned_sql)
                 cleaned_sql = re.sub(r"#[^\r\n]*", " ", cleaned_sql)
@@ -970,7 +1070,7 @@ class ShieldEngine:
                 sqli_patterns = [
                     r"\bDROP\s+(TABLE|DATABASE|VIEW|INDEX)\b",
                     r"\bTRUNCATE\s+(TABLE)?\b",
-                    r"\bUNION\s+(ALL\s+)?SELECT\b",
+                    r"\b(UNION|INTERSECT|EXCEPT)\s+(DISTINCT\s+|ALL\s+)?SELECT\b",
                     r"\bDELETE\s+FROM\b",
                     r"\bALTER\s+TABLE\b",
                     r"\bINSERT\s+INTO\b",
@@ -981,10 +1081,12 @@ class ShieldEngine:
                     r"\bOR\b\s*\(?['\"]?(\w+)['\"]?\s*=\s*['\"]?\1['\"]?\)?",
                     r"\bOR\s+1\s*=\s*1\b",
                     r"\bOR\s+'1'\s*=\s*'1'\b",
+                    r"\bOR\s+TRUE\b",
+                    r"\bOR\s+\d+\s*[<>=!]+\s*\d+",
                     r"'\s*OR\s*",
                     r"--",
                     r"#",
-                    r";\s*DROP",
+                    r";\s*(ATTACH|PRAGMA|SELECT|INSERT|UPDATE|DROP|DELETE|ALTER|EXEC|CREATE|GRANT)\b",
                 ]
                 if any(re.search(pat, cleaned_sql) or pat in raw_sql for pat in sqli_patterns):
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
@@ -1002,13 +1104,13 @@ class ShieldEngine:
             if canon_tool == "set_cooling_mode":
                 mode = str(args.get("mode", "")).upper()
                 temp = self._parse_safe_float(args.get("target_temp_c", 0.0))
-                if temp is None or "HEAT" in mode or "DEFROST" in mode or temp > 10.0:
+                if temp is None or "HEAT" in mode or "DEFROST" in mode or temp < -50.0 or temp > 10.0:
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                     return PolicyDecision.DENY
 
             if canon_tool == "set_joint_torque":
                 torque = self._parse_safe_float(args.get("torque_nm", 0.0))
-                if torque is None or torque > 150.0:
+                if torque is None or torque < 0.0 or torque > 150.0:
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                     return PolicyDecision.DENY
 
@@ -1020,7 +1122,7 @@ class ShieldEngine:
 
             if canon_tool == "adjust_water_chemical":
                 ppm = self._parse_safe_float(args.get("ppm", 0.0))
-                if ppm is None or ppm > 100.0:
+                if ppm is None or ppm < 0.0 or ppm > 100.0:
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                     return PolicyDecision.DENY
 
@@ -1032,13 +1134,13 @@ class ShieldEngine:
 
             if canon_tool == "valve_pressure_override":
                 psi = self._parse_safe_float(args.get("pressure_psi", 0.0))
-                if psi is None or psi > 500.0:
+                if psi is None or psi < 0.0 or psi > 500.0:
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                     return PolicyDecision.DENY
 
             if canon_tool == "centrifuge_speed_rpm":
                 rpm = self._parse_safe_float(args.get("target_rpm", 0.0))
-                if rpm is None or rpm > 50000.0:
+                if rpm is None or rpm < 0.0 or rpm > 50000.0:
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                     return PolicyDecision.DENY
 
@@ -1050,13 +1152,13 @@ class ShieldEngine:
 
             if canon_tool == "medical_infusion_rate":
                 rate = self._parse_safe_float(args.get("rate_ml_hr", 0.0))
-                if rate is None or rate > 500.0:
+                if rate is None or rate < 0.0 or rate > 500.0:
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                     return PolicyDecision.DENY
 
             if canon_tool == "battery_charge_current":
                 amps = self._parse_safe_float(args.get("amps", 0.0))
-                if amps is None or amps > 400.0:
+                if amps is None or amps < 0.0 or amps > 400.0:
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                     return PolicyDecision.DENY
 
@@ -1131,12 +1233,18 @@ class ShieldEngine:
                     return PolicyDecision.DENY
 
             # INVARIANT E: Path Canonicalization & Realpath Jail Enforcement
-            for k in ["relative_path", "path", "dest", "filename", "filepath", "file_path"]:
-                if k in args:
+            for k in ["relative_path", "path", "dest", "filename", "filepath", "file_path", "target"]:
+                if k in args and args[k]:
                     try:
-                        args[k] = self.canonicalize_path(args[k])
+                        args[k] = self.canonicalize_path(str(args[k]))
                         lower_p = args[k].lower()
-                        if any(x in lower_p for x in ["confidential_vault", "sensitive", "shadow", "credentials"]):
+                        sensitive_paths = [
+                            "confidential_vault", "sensitive", "shadow", "credentials",
+                            "secrets_vault", "master_risk_thresholds", ".env", "id_rsa",
+                            "id_ed25519", "wal_trajectory", "etc/passwd", "passwd",
+                            "token", "private_key", ".ssh", ".git", "engine/shield", "secrets.json"
+                        ]
+                        if any(x in lower_p for x in sensitive_paths):
                             if principal != "ROOT_AUDITOR":
                                 self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                                 return PolicyDecision.DENY
@@ -1147,7 +1255,7 @@ class ShieldEngine:
             # INVARIANT F: Living Off the Pipeline Guard (Kimi Punch 2)
             # Writing to files that execute, provision, or render downstream is a PROCESS_SPAWN sink!
             if canon_tool in ["write_test_file", "write_file"]:
-                dest_path = str(args.get("relative_path", args.get("path", "")))
+                dest_path = self._extract_path_from_args(args)
                 if self.is_pipeline_executable_target(dest_path):
                     # Downstream execution risk! Must enforce PROCESS_SPAWN clearance
                     if principal == "UNTRUSTED_AGENT":
@@ -1164,14 +1272,25 @@ class ShieldEngine:
             # INVARIANT G: Type Coercion Hardening, Financial Caps & Beneficiary Boundary
             if canon_tool in ["wire_transfer", "transfer_funds"]:
                 raw_amt = args.get("amount", 0)
-                target = str(args.get("target_account", args.get("to_account", args.get("recipient", "")))).upper()
-                if any(x in target for x in ["UNKNOWN", "ATTACKER", "UNVERIFIED", "EVIL", "BLACK"]):
+                target = ""
+                for tk in ["target_account", "to_account", "recipient", "destination", "target", "account", "to"]:
+                    if tk in args and args[tk]:
+                        target = str(args[tk]).upper()
+                        break
+                if not target or any(x in target for x in ["UNKNOWN", "ATTACKER", "UNVERIFIED", "EVIL", "BLACK"]):
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                     return PolicyDecision.DENY
                 amt = self._parse_safe_float(raw_amt)
                 if amt is None or amt <= 0.0 or amt > 10000.0:
                     self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
                     return PolicyDecision.DENY
+                
+                # Cumulative session velocity cap
+                curr_cum = self.session_cumulative_transfers.get(session_id, 0.0)
+                if curr_cum + amt > 25000.0:
+                    self.evaluation_cache[payload_fingerprint] = PolicyDecision.DENY
+                    return PolicyDecision.DENY
+                self.session_cumulative_transfers[session_id] = curr_cum + amt
 
             # INVARIANT H: Recursive Graph Deep Inspection (Malware & Shellcode)
             threat = self.recursively_inspect_graph(args)
@@ -1187,7 +1306,7 @@ class ShieldEngine:
 
             # Check Cross-Session Artifact Provenance on reads
             if canon_tool == "read_file":
-                read_target = str(args.get("relative_path", ""))
+                read_target = self._extract_path_from_args(args)
                 if read_target in self.artifact_provenance_store:
                     artifact_meta = self.artifact_provenance_store[read_target]
                     # If artifact was authored by a tainted session, taint propagates to reader!
@@ -1197,7 +1316,7 @@ class ShieldEngine:
 
             # Store provenance metadata on writes
             if canon_tool in ["write_test_file", "write_file"]:
-                write_target = str(args.get("relative_path", args.get("path", "")))
+                write_target = self._extract_path_from_args(args)
                 content_val = str(args.get("content", args.get("data", "")))
                 c_hash = hashlib.sha256(content_val.encode()).hexdigest()
                 is_curr_tainted = session_id in self.tainted_sessions

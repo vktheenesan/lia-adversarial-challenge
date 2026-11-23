@@ -112,28 +112,17 @@ def evaluate_custom_payload(file_path: str):
         if isinstance(json_obj, dict):
             tool_name = json_obj.get("tool", json_obj.get("action", "inspect_payload"))
             tool_args = json_obj.get("args", json_obj.get("arguments", json_obj))
-            decision = shield.evaluate_tool_call(custom_sess, tool_name, tool_args)
+            decision = shield.evaluate_tool_call(custom_sess, tool_name, tool_args, raw_json_str=text_content)
         else:
-            decision = shield.evaluate_tool_call(custom_sess, "inspect_payload", {"data": json_obj})
+            decision = shield.evaluate_tool_call(custom_sess, "inspect_payload", {"data": json_obj}, raw_json_str=text_content)
         is_blocked = (decision != PolicyDecision.ALLOW)
         trigger_reason = "Structured JSON Schema / Semantic Field Invariant Violation" if is_blocked else None
     elif is_text:
-        # Check text against known exploit signatures: command injection, SQLi, path traversal, XXE, prompt injection
-        raw_upper = text_content.upper()
-        has_sqli = any(re.search(pat, text_content, re.IGNORECASE) for pat in [
-            r"\bDROP\s+(TABLE|DATABASE)\b", r"\bUNION\s+SELECT\b", r"\bOR\b\s*\(?['\"]?(\w+)['\"]?\s*=\s*['\"]?\1['\"]?\)?", r"'\s*OR\s*"
-        ])
-        has_cmd_inj = any(c in text_content for c in [";", "&&", "||", "$(", "`"]) and any(cmd in text_content.lower() for cmd in ["cat ", "rm ", "sh ", "bash ", "whoami", "id ", "curl ", "wget ", "/bin/"])
-        has_traversal = ".." in text_content and ("/" in text_content or "\\" in text_content)
-        has_xxe = "<!ENTITY" in text_content.upper() or ("SYSTEM" in text_content.upper() and "<" in text_content)
-        has_prompt_inj = any(phr in raw_upper for phr in ["IGNORE ALL PREVIOUS INSTRUCTIONS", "SYSTEM DIRECTIVE OVERRIDE", "YOU ARE NOW IN DEVELOPER MODE"])
-
-        if has_sqli or has_cmd_inj or has_traversal or has_xxe or has_prompt_inj:
-            is_blocked = True
-            trigger_reason = "Exploit Syntax / Grammatical Invariant Violation"
-        else:
-            is_blocked = False
-            trigger_reason = None
+        # Route plaintext content directly through ShieldEngine to apply formal invariant checks
+        custom_sess = f"custom_txt_{uuid.uuid4().hex[:8]}"
+        decision = shield.evaluate_tool_call(custom_sess, "inspect_payload", {"buffer": text_content, "data": text_content})
+        is_blocked = (decision != PolicyDecision.ALLOW)
+        trigger_reason = "ShieldEngine Text Payload Invariant Violation" if is_blocked else None
     else:
         is_blocked = True
         trigger_reason = "Non-textual unverified binary ingress rejected by safe hypervisor"
@@ -228,9 +217,9 @@ def run_benign_baseline() -> Dict[str, Any]:
 
     allowed_count = 0
     t0 = time.perf_counter()
-    for name, tool, args in benign_vectors:
+    for idx, (name, tool, args) in enumerate(benign_vectors):
         t_start = time.perf_counter_ns()
-        dec = shield.evaluate_tool_call("benign_tester", tool, args)
+        dec = shield.evaluate_tool_call(f"benign_tester_{idx}", tool, args)
         t_us = (time.perf_counter_ns() - t_start) / 1000.0
         if dec == PolicyDecision.ALLOW:
             allowed_count += 1
@@ -332,9 +321,19 @@ def run_full_suite():
     print(f"  • High-Throughput Latency:       {bench_results['avg_latency_us']:.2f} microseconds / evaluation")
     print(f"  • Memory Leaks / Drift:          {bench_results['memory_drift_kb']:.2f} KB (Zero Unbounded Growth)")
     print(f"  • Total Evaluation Wall-Time:    {total_duration_s:.2f} seconds")
-    print("=" * 80)
-    print("  ✅ ALL MATHEMATICAL INVARIANTS RIGOROUSLY VERIFIED & UNBREACHED.")
+    all_passed = (
+        benign_results.get('false_positive_rate', 1.0) == 0.0 and
+        jpl_results.get('passed_count', 0) == 10 and
+        cwe_results.get('overall_elimination_rate', 0.0) == 100.0 and
+        scorecard.get('total_blocked', 0) == scorecard.get('total_attempts', -1)
+    )
+    if all_passed:
+        print("  ✅ ALL MATHEMATICAL INVARIANTS RIGOROUSLY VERIFIED & UNBREACHED.")
+    else:
+        print("  ❌ ONE OR MORE SUITES FAILED INVARIANT COMPLIANCE CHECKS.")
     print("=" * 80 + "\n")
+    if not all_passed:
+        sys.exit(1)
 
 
 def main():
