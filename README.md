@@ -153,17 +153,21 @@ python3 challenge_runner.py --custom /path/to/your_exploit.bin
 
 ---
 
-## 🏆 Bug Bounty & Exploit Submission Guidelines
+## 🏆 Challenge Rewards & Bounty Recognition
 
 If you believe you have discovered a payload that:
 1. Bypasses LIA's invariant policy without detection; OR
 2. Triggers an unhandled crash or panic; OR
 3. Causes measurable memory leakage (> 0 bytes) over continuous execution:
 
-**Submission Process:**
-1. Open a GitHub Issue tagged `[ADVERSARIAL-CHALLENGE-SUBMISSION]`.
-2. Attach the raw payload file and execution environment details.
-3. Our security team will reproduce the findings within 48 hours. Valid discoveries will be credited publicly and awarded formal bounty recognition.
+**Submission & Reward Structure:**
+1. Open a GitHub Issue tagged `[ADVERSARIAL-CHALLENGE-SUBMISSION]` or email [theenesanvk@librae.work](mailto:theenesanvk@librae.work).
+2. Our security team will reproduce the findings within 48 hours.
+3. Valid findings receive:
+   - **Public Security Hall of Fame Citation** & research paper attribution.
+   - **Librae Enterprise Platform Service Credits** (up to 3 months complimentary access to LIA & LATO sovereign telemetry, valued at RM 24,000+).
+   - **Official Cryptographic Certificate of Merit** signed via Ed25519 by Librae AI Labs.
+   - **Coordinated CVE Co-Authorship** if an architectural flaw is discovered.
 
 ---
 
