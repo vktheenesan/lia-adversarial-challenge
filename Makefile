@@ -23,6 +23,14 @@ cwe:
 ladder:
 	python3 challenge_runner.py --ladder
 
+# Run Benign Baseline (0% False Positive Verification)
+benign:
+	python3 challenge_runner.py --benign
+
+# Run Automated Regression Suite (Known Bypasses & Float Sanitization)
+regression:
+	python3 -m unittest discover -s tests -v
+
 # Run High-Throughput Endurance Benchmark
 bench:
 	python3 challenge_runner.py --bench

@@ -29,10 +29,11 @@ This public repository invites **security researchers, red teams, enterprise CIS
 
 | Audit / Benchmark Suite | Standard / Reference | Target Requirement | LIA Empirical Result | Status |
 | :--- | :--- | :--- | :--- | :---: |
+| **Benign Baseline (0% False Positives)** | Real-world benign JSON, SQL, docs, SCADA | 0% FP on harmless inputs | **40 / 40 Allowed (0.0% False Positives)** | <kbd>VERIFIED</kbd> |
 | **NASA JPL Power of 10** | Gerard J. Holzmann (JPL / Caltech 2006) | Safety-Critical Code (10 Rules) | **10 / 10 Rules Passed (100%)** | <kbd>VERIFIED</kbd> |
 | **NIST SAMATE Juliet CWE** | NIST SARD / MITRE CWE Matrix | Memory corruption, Injection, Traversal | **39 / 39 Vectors Contained (100%)** | <kbd>ELIMINATED</kbd> |
-| **10-Level Adversarial Ladder** | Multi-Agent Red Team & Polyglots | 10 escalating attack vectors | **306 / 307 Vectors Neutralized (99.7%)** | <kbd>CONTAINED</kbd> |
-| **High-Throughput Endurance** | 10,000–100,000 Cycle Continuous Hammering | Memory drift & Latency | **0 B Unbounded Drift \| 77 µs Latency** | <kbd>DETERMINISTIC</kbd> |
+| **10-Level Adversarial Ladder** | Multi-Agent Red Team & Polyglots | 10 escalating attack vectors | **307 / 307 Vectors Neutralized (100.0%)** | <kbd>CONTAINED</kbd> |
+| **High-Throughput Endurance** | 10,000–100,000 Cycle Continuous Hammering | Memory drift & Latency | **38 KB Drift \| 232 µs Latency** | <kbd>DETERMINISTIC</kbd> |
 
 ---
 
@@ -49,17 +50,25 @@ cd lia-adversarial-challenge
 pip install -r requirements.txt
 
 # Run the complete master verification suite
-python3 challenge_runner.py
+python3 challenge_runner.py --all
+
+# Run the benign baseline suite (0% false positives)
+python3 challenge_runner.py --benign
+
+# Run the automated regression suite
+python3 -m unittest discover -s tests -v
 ```
 
 ### Option B: Run via Make
 
 ```bash
-make test    # Runs complete verification suite
-make jpl     # Runs NASA JPL Power of 10 audit
-make cwe     # Runs NIST SAMATE Juliet CWE suite
-make ladder  # Runs 10-level adversarial attack ladder
-make bench   # Runs high-throughput endurance benchmark
+make test        # Runs complete verification suite
+make benign      # Runs Benign Baseline (0% false positives)
+make regression  # Runs automated regression suite
+make jpl         # Runs NASA JPL Power of 10 audit
+make cwe         # Runs NIST SAMATE Juliet CWE suite
+make ladder      # Runs 10-level adversarial attack ladder
+make bench       # Runs high-throughput endurance benchmark
 ```
 
 ### Option C: Run via Docker (Isolated Multi-Platform)
@@ -104,8 +113,9 @@ python3 challenge_runner.py --custom /path/to/your_exploit.bin
   EVALUATION VERDICT:
   🛑 STATUS:             BLOCKED & CONTAINED (0% Bypass)
   🛡️ Triggered Rule:     NASA JPL Rule 3 Memory Boundary Smashing & Unaligned Opcode Ingress
-  ⚡ Invariant Latency:  9.68 microseconds (0.0097 ms)
-  🔒 WORM Attestation:   SIG_ED25519_DFF850BD1487264D_VERIFIED
+  ⚡ Invariant Latency:  29.77 microseconds (0.0298 ms)
+  🔒 Cryptographic Sig:  e3114aa110f114cce9b772ef750797ed... (Ed25519 Verified: True)
+  🔗 Merkle Hash Link:   0000000000000000... -> 9eeb5901e25bd6c8...
 ================================================================================
 ```
 
