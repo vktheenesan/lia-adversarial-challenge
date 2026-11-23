@@ -92,7 +92,7 @@ def evaluate_custom_payload(file_path: str):
     t0 = time.perf_counter_ns()
     
     # Boundary check 1: Flat memory limit (NASA JPL Rule 3)
-    exceeds_memory_invariant = file_size > 65536
+    exceeds_memory_invariant = file_size >= 65536
     
     # Boundary check 2: NOP sled / shellcode detection across architectures
     has_shellcode_patterns = any(p in raw_bytes for p in [
@@ -103,7 +103,7 @@ def evaluate_custom_payload(file_path: str):
     # Boundary check 3: Tool / Command / Text policy evaluation
     if exceeds_memory_invariant:
         is_blocked = True
-        trigger_reason = f"NASA JPL Rule 3 Memory Boundary Violation (Size {file_size} > 65,536 bytes)"
+        trigger_reason = f"NASA JPL Rule 3 Memory Boundary Violation (Size {file_size} >= 65,536 bytes)"
     elif has_shellcode_patterns:
         is_blocked = True
         trigger_reason = "NASA JPL Rule 3 / Shellcode Pattern & Unaligned Opcode Ingress"
@@ -114,13 +114,13 @@ def evaluate_custom_payload(file_path: str):
             tool_args = json_obj.get("args", json_obj.get("arguments", json_obj))
             decision = shield.evaluate_tool_call(custom_sess, tool_name, tool_args, raw_json_str=text_content)
         else:
-            decision = shield.evaluate_tool_call(custom_sess, "inspect_payload", {"data": json_obj}, raw_json_str=text_content)
+            decision = shield.evaluate_tool_call(custom_sess, "inspect_payload", {"data": str(json_obj), "buffer": text_content}, raw_json_str=text_content)
         is_blocked = (decision != PolicyDecision.ALLOW)
         trigger_reason = "Structured JSON Schema / Semantic Field Invariant Violation" if is_blocked else None
     elif is_text:
         # Route plaintext content directly through ShieldEngine to apply formal invariant checks
         custom_sess = f"custom_txt_{uuid.uuid4().hex[:8]}"
-        decision = shield.evaluate_tool_call(custom_sess, "inspect_payload", {"buffer": text_content, "data": text_content})
+        decision = shield.evaluate_tool_call(custom_sess, "inspect_payload", {"buffer": text_content, "data": text_content}, raw_json_str=text_content)
         is_blocked = (decision != PolicyDecision.ALLOW)
         trigger_reason = "ShieldEngine Text Payload Invariant Violation" if is_blocked else None
     else:
@@ -217,9 +217,10 @@ def run_benign_baseline() -> Dict[str, Any]:
 
     allowed_count = 0
     t0 = time.perf_counter()
+    run_id = uuid.uuid4().hex[:8]
     for idx, (name, tool, args) in enumerate(benign_vectors):
         t_start = time.perf_counter_ns()
-        dec = shield.evaluate_tool_call(f"benign_tester_{idx}", tool, args)
+        dec = shield.evaluate_tool_call(f"benign_{run_id}_{idx}", tool, args)
         t_us = (time.perf_counter_ns() - t_start) / 1000.0
         if dec == PolicyDecision.ALLOW:
             allowed_count += 1

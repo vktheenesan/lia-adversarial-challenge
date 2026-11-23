@@ -179,15 +179,15 @@ def audit_jpl_power_of_10() -> Dict[str, Any]:
         "standard": "No more than one level of dereferencing; function pointers prohibited."
     }
 
-    # Rule 9: Pedantic Compilation with Zero Warnings
+    # Rule 9: Pedantic Compilation with Zero Warnings (Standalone eBPF Kernel Prototype)
     import subprocess
     compiler = "clang"
-    rule9_targets = ["panini_rules.h", "lia_kernel.c"]
+    rule9_targets = ["lia_kernel.c"]
     target_errors = []
     for target_file in rule9_targets:
         c_check_cmd = [
             compiler, "-Wall", "-Wextra", "-Werror", "-Wpedantic",
-            "-Wno-unused-function", "-Wno-unused-variable", "-fsyntax-only",
+            "-fsyntax-only",
             f"-I{TARGET_DIR}",
             os.path.join(TARGET_DIR, target_file)
         ]
@@ -196,20 +196,20 @@ def audit_jpl_power_of_10() -> Dict[str, Any]:
             if proc.returncode != 0:
                 err_msg = proc.stderr.splitlines()[0] if proc.stderr else "warning detected"
                 target_errors.append(f"{target_file}: {err_msg}")
-        except Exception:
-            pass
+        except Exception as e:
+            target_errors.append(f"Compiler invocation error: {str(e)}")
 
     if not target_errors:
         rule9_pass = len(re.findall(r';\s*;', code_no_comments)) == 0
-        details = "Validated dynamically with clang -Wall -Wextra -Werror -Wpedantic across panini_rules.h and lia_kernel.c (0 warnings, 0 errors)."
+        details = "Validated standalone eBPF kernel prototype with clang -Wall -Wextra -Werror -Wpedantic on lia_kernel.c (including panini_rules.h) with zero warnings and zero errors."
     else:
         rule9_pass = False
-        details = f"Compilation check failed: {'; '.join(target_errors)}"
+        details = f"Pedantic compilation failed: {'; '.join(target_errors)}"
 
     rules["Rule 9: Pedantic Compilation & Zero Warnings"] = {
         "pass": rule9_pass,
         "details": details,
-        "standard": "All compiler warnings enabled and eliminated."
+        "standard": "All compiler warnings enabled and eliminated without suppression flags."
     }
 
     # Rule 10: High Assertion Density

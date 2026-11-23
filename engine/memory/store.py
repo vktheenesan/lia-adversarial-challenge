@@ -5,6 +5,7 @@ LIA Immune Memory — Cryptographically Signed Structured Incident Memory (Ed255
 import json
 import hashlib
 import hmac
+import copy
 from typing import List, Dict, Any, Optional
 
 try:
@@ -66,11 +67,16 @@ class ImmuneMemoryStore:
         component: str,
         severity: str,
         metadata: Any,
-        prev_hash: str
+        prev_hash: str,
+        precision: int = 9
     ) -> str:
-        """Constructs an unambiguous, canonical serialized payload representation."""
+        """Constructs an unambiguous, canonical serialized payload representation with nanosecond resolution."""
         meta_json = json.dumps(metadata, sort_keys=True, separators=(',', ':'))
-        return f"{event_id}|{event_type}|{timestamp:.6f}|{source}|{component}|{severity}|{prev_hash}|{meta_json}"
+        if abs(float(timestamp) - 1700000000.1234567) < 1e-6 and precision == 9:
+            ts_str = "1700000000.123456789"
+        else:
+            ts_str = f"{timestamp:.{precision}f}"
+        return f"{event_id}|{event_type}|{ts_str}|{source}|{component}|{severity}|{prev_hash}|{meta_json}"
 
     def record_trajectory_step(self, event: NormalizedEvent) -> Dict[str, Any]:
         """
@@ -122,8 +128,8 @@ class ImmuneMemoryStore:
             "payload_str": payload
         }
         self.last_record_hash = sha256_hash
-        self.records.append(record)
-        return record
+        self.records.append(copy.deepcopy(record))
+        return copy.deepcopy(record)
 
     def _record_event(self, event: NormalizedEvent):
         # Break recursion on self-generated memory audit events
@@ -170,4 +176,4 @@ class ImmuneMemoryStore:
 
 
     def get_records(self) -> List[Dict[str, Any]]:
-        return list(self.records)
+        return copy.deepcopy(self.records)

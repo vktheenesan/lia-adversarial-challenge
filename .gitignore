@@ -10,7 +10,11 @@ build/
 
 # Reports and temporary outputs
 adversarial_reports/
+wal_trajectory.jsonl
+*.jsonl
 *.tmp
 *.log
 .DS_Store
-*.jsonl
+
+# Local Red Team audit artifacts (internal R&D)
+red_team/

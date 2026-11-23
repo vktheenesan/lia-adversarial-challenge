@@ -1,40 +1,9 @@
-Apache License
-Version 2.0, January 2004
-http://www.apache.org/licenses/
+Copyright (c) 2026 Librae AI Labs Sdn. Bhd. All Rights Reserved.
 
-TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+PROPRIETARY ADVERSARIAL EVALUATION & RESEARCH LICENSE
 
-1. Definitions.
-   "License" shall mean the terms and conditions for use, reproduction,
-   and distribution as defined by Sections 1 through 9 of this document.
-   "Licensor" shall mean the copyright owner or entity authorized by
-   the copyright owner that is granting the License.
-   "Legal Entity" shall mean the union of the acting entity and all
-   other entities that control, are controlled by, or are under common
-   control with that entity.
+Access is granted solely for security testing, academic research, and adversarial evaluation of this challenge repository. 
 
-2. Grant of Copyright License. Subject to the terms and conditions of
-   this License, each Contributor hereby grants to You a perpetual,
-   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
-   copyright license to reproduce, prepare Derivative Works of,
-   publicly display, publicly perform, sublicense, and distribute the
-   Work and such Derivative Works in Source or Object form.
+Commercial use, production deployment, sublicensing, extraction into commercial products, or unauthorized redistribution without prior express written license from Librae AI Labs Sdn. Bhd. is strictly prohibited.
 
-3. Grant of Patent License. Subject to the terms and conditions of
-   this License, each Contributor hereby grants to You a perpetual,
-   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
-   patent license to make, have made, use, offer to sell, sell, import,
-   and otherwise transfer the Work.
-
-4. Redistribution. You may reproduce and distribute copies of the
-   Work or Derivative Works thereof in any medium, with or without
-   modifications, provided that You meet the conditions of this License.
-
-5. Invariant Evaluation Notice.
-   The LIA verification harness, adversarial benchmark suites, and test
-   runners are released under the Apache 2.0 license. The commercial
-   LIA (Librae Invariant Architecture) proprietary production core,
-   hardware cryptographic interlocks, and sovereign ASIC designs
-   remain the intellectual property of Librae AI Labs Sdn Bhd.
-
-Copyright (c) 2026 Librae AI Labs Sdn Bhd. All rights reserved.
+Patented under Malaysian Patents Act 1983 (MyIPO) and International Patent Classifications (IPC) G06F 21/52, G06F 21/54, G06N 3/00, G06N 20/00. All underlying proprietary reference monitor architecture, hardware interlocks, and cryptographic frameworks remain the exclusive property of Librae AI Labs Sdn. Bhd.
